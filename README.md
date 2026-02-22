@@ -2,7 +2,6 @@
 
 Tracing JIT compiler for the [Wren](https://wren.io) scripting language. Uses
 [SLJIT](https://github.com/zherczeg/sljit) as the code generation backend.
-Achieves roughly 4x speedup over the interpreter on numeric loops.
 
 ## How it works
 
