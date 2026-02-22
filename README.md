@@ -56,11 +56,33 @@ frame when all registers in a class are live.
 
 `bench_sum.wren` — sum integers 0..999999 in a `while` loop:
 
-| mode        | time   |
-|-------------|--------|
-| interpreter | 19.5 ms |
-| JIT         | 4.7 ms |
-| C (-O3)     | 1.1 ms |
+| mode        | time    |
+|-------------|---------|
+| interpreter | 19.2 ms |
+| JIT         | 5.0 ms  |
+| C (-O3)     | 1.1 ms  |
+
+3.8× speedup over the interpreter. JIT compiled 1 trace, 0 aborts.
+
+`bench_for.wren` — sum 1..1000000 via `for i in range`:
+
+| mode        | time    | notes              |
+|-------------|---------|-------------------|
+| interpreter | 18.8 ms |                   |
+| JIT         | 19.9 ms | 16 aborts, 0 traces compiled |
+
+Range-based `for` uses `CALL_1` on a non-`Num` receiver (the Range iterator);
+recording aborts and the interpreter handles the full loop.
+
+`bench_fib.wren` — recursive Fibonacci(35):
+
+| mode        | time    | notes         |
+|-------------|---------|---------------|
+| interpreter | 645 ms  |               |
+| JIT         | 649 ms  | 0 traces compiled |
+| C (-O3)     | 29.6 ms |               |
+
+Recursive calls do not form a traceable hot loop; JIT has no effect.
 
 ## Build
 
