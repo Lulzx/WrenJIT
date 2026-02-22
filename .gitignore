@@ -1,0 +1,8 @@
+build/
+build-jit/
+build-nojit/
+*.o
+*.a
+*.d
+*.dylib
+*.so
