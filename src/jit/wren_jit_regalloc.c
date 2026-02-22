@@ -142,21 +142,17 @@ void regAllocInit(RegAllocState* state, int ssa_count)
 
 void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
 {
-    // Temporary per-SSA-id tracking. We use the ranges array indexed by SSA id
-    // during construction, then compact it afterwards.
-    // Track whether we have seen a definition for each SSA id.
-    bool* defined = (bool*)calloc((size_t)buf->count, sizeof(bool));
-    uint16_t* range_end = (uint16_t*)calloc((size_t)buf->count, sizeof(uint16_t));
-    uint16_t* range_start = (uint16_t*)calloc((size_t)buf->count, sizeof(uint16_t));
-    RegClass* rclass = (RegClass*)calloc((size_t)buf->count, sizeof(RegClass));
+    // Temporary per-SSA-id tracking. Stack-allocated to avoid malloc overhead
+    // on every trace compilation (IR_MAX_NODES=4096, total ~36KB on stack).
+    bool defined[IR_MAX_NODES];
+    uint16_t range_end[IR_MAX_NODES];
+    uint16_t range_start[IR_MAX_NODES];
+    RegClass rclass[IR_MAX_NODES];
 
-    if (!defined || !range_end || !range_start || !rclass) {
-        free(defined);
-        free(range_end);
-        free(range_start);
-        free(rclass);
-        return;
-    }
+    memset(defined,      0, sizeof(bool)    * buf->count);
+    memset(range_end,    0, sizeof(uint16_t) * buf->count);
+    memset(range_start,  0, sizeof(uint16_t) * buf->count);
+    memset(rclass,       0, sizeof(RegClass) * buf->count);
 
     // Pass 1: Walk IR nodes forward, record definition points and extend
     //         live ranges for operand uses.
@@ -198,19 +194,23 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
     }
 
     // Pass 2: Extend snapshot entries' live ranges.
-    // Snapshot entries keep SSA values alive until the last side exit that
-    // references the snapshot.
+    // Pre-compute the last side-exit index for each snapshot in one forward
+    // scan instead of O(snapshot_count × count) nested loops.
+    uint16_t last_exit_for_snap[IR_MAX_SNAPSHOTS];
+    memset(last_exit_for_snap, 0, sizeof(uint16_t) * buf->snapshot_count);
+
+    for (uint16_t i = 0; i < buf->count; i++) {
+        const IRNode* n = &buf->nodes[i];
+        if (n->op == IR_SIDE_EXIT) {
+            uint16_t sid = n->imm.snapshot_id;
+            if (sid < buf->snapshot_count && i > last_exit_for_snap[sid])
+                last_exit_for_snap[sid] = i;
+        }
+    }
+
     for (uint16_t si = 0; si < buf->snapshot_count; si++) {
         const IRSnapshot* snap = &buf->snapshots[si];
-        // Find the latest side exit referencing this snapshot.
-        uint16_t last_exit = 0;
-        for (uint16_t i = 0; i < buf->count; i++) {
-            const IRNode* n = &buf->nodes[i];
-            if (n->op == IR_SIDE_EXIT && n->imm.snapshot_id == si) {
-                if (i > last_exit)
-                    last_exit = i;
-            }
-        }
+        uint16_t last_exit = last_exit_for_snap[si];
 
         // Extend all SSA refs in this snapshot to that exit point.
         for (uint16_t e = 0; e < snap->num_entries; e++) {
@@ -277,10 +277,6 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
     qsort(state->ranges, (size_t)state->num_ranges, sizeof(LiveRange),
           cmpRangeStart);
 
-    free(defined);
-    free(range_end);
-    free(range_start);
-    free(rclass);
 }
 
 // ---------------------------------------------------------------------------

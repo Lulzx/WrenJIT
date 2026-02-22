@@ -122,18 +122,6 @@ static uint16_t findLoopBack(const IRBuffer* buf)
     return IR_NONE;
 }
 
-// Build per-node use counts.
-static void buildUseCounts(const IRBuffer* buf, uint16_t* counts)
-{
-    memset(counts, 0, sizeof(uint16_t) * IR_MAX_NODES);
-    for (uint16_t i = 0; i < buf->count; i++) {
-        const IRNode* n = &buf->nodes[i];
-        if (n->op == IR_NOP) continue;
-        if (n->op1 != IR_NONE && n->op1 < buf->count) counts[n->op1]++;
-        if (n->op2 != IR_NONE && n->op2 < buf->count) counts[n->op2]++;
-    }
-}
-
 // ===========================================================================
 // Pass 1: Box/Unbox Elimination (~200 LOC)
 //
@@ -197,49 +185,53 @@ void irOptBoxUnboxElim(IRBuffer* buf)
 
     // --- Phase 2: use-count based elimination for BOX_NUM ---
     // If a BOX_NUM's *only* consumers are UNBOX_NUM, bypass the box entirely.
+    //
+    // Build two parallel use-count arrays in one O(n) forward pass:
+    //   useCounts[i]      = total number of uses of node i
+    //   unboxUseCounts[i] = how many of those uses are IR_UNBOX_NUM
+    // A BOX_NUM i is eliminable iff useCounts[i] == unboxUseCounts[i] > 0
+    // and it does not appear in any snapshot entry.
     static uint16_t useCounts[IR_MAX_NODES];
-    buildUseCounts(buf, useCounts);
+    static uint16_t unboxUseCounts[IR_MAX_NODES];
+
+    memset(useCounts,      0, sizeof(uint16_t) * buf->count);
+    memset(unboxUseCounts, 0, sizeof(uint16_t) * buf->count);
+
+    for (uint16_t j = 0; j < buf->count; j++) {
+        const IRNode* u = &buf->nodes[j];
+        if (u->op == IR_NOP) continue;
+        if (u->op1 != IR_NONE && u->op1 < buf->count) {
+            useCounts[u->op1]++;
+            if (u->op == IR_UNBOX_NUM) unboxUseCounts[u->op1]++;
+        }
+        if (u->op2 != IR_NONE && u->op2 < buf->count) {
+            useCounts[u->op2]++;
+            if (u->op == IR_UNBOX_NUM) unboxUseCounts[u->op2]++;
+        }
+    }
+
+    // Build snapshot escape bitset in one pass.
+    static uint64_t inSnapshot[BITSET_WORDS];
+    memset(inSnapshot, 0, sizeof(inSnapshot));
+    for (uint16_t s = 0; s < buf->snapshot_entry_count; s++) {
+        uint16_t ref = buf->snapshot_entries[s].ssa_ref;
+        if (ref != IR_NONE && ref < buf->count)
+            bitSet(inSnapshot, ref);
+    }
 
     for (uint16_t i = 0; i < buf->count; i++) {
         IRNode* n = &buf->nodes[i];
         if (n->op != IR_BOX_NUM || n->op1 == IR_NONE) continue;
         if (useCounts[i] == 0) continue;
-
-        // Check that every user of this BOX_NUM is an UNBOX_NUM.
-        bool allUnbox = true;
-        uint16_t unboxCount = 0;
-        for (uint16_t j = 0; j < buf->count; j++) {
-            IRNode* u = &buf->nodes[j];
-            if (u->op == IR_NOP) continue;
-            bool uses = (u->op1 == i) || (u->op2 == i);
-            if (!uses) continue;
-            if (u->op != IR_UNBOX_NUM) {
-                allUnbox = false;
-                break;
-            }
-            unboxCount++;
-        }
-
-        // Also check snapshot entries -- if the BOX_NUM appears in a snapshot,
-        // it escapes and we cannot eliminate it.
-        if (allUnbox) {
-            for (uint16_t s = 0; s < buf->snapshot_entry_count; s++) {
-                if (buf->snapshot_entries[s].ssa_ref == i) {
-                    allUnbox = false;
-                    break;
-                }
-            }
-        }
-
-        if (!allUnbox || unboxCount == 0) continue;
+        if (bitTest(inSnapshot, i)) continue;        // escapes via snapshot
+        if (useCounts[i] != unboxUseCounts[i]) continue; // non-UNBOX_NUM user
 
         uint16_t rawInput = n->op1;
 
         // Redirect each UNBOX_NUM consumer to use rawInput directly.
         for (uint16_t j = 0; j < buf->count; j++) {
             IRNode* u = &buf->nodes[j];
-            if (u->op != IR_UNBOX_NUM) continue;
-            if (u->op1 != i) continue;
+            if (u->op != IR_UNBOX_NUM || u->op1 != i) continue;
             replaceUses(buf, j, rawInput);
             killNode(u);
         }

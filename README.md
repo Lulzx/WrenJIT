@@ -58,11 +58,11 @@ frame when all registers in a class are live.
 
 | mode        | time    |
 |-------------|---------|
-| interpreter | 19.2 ms |
-| JIT         | 5.0 ms  |
-| C (-O3)     | 1.1 ms  |
+| interpreter | 18.3 ms |
+| JIT         | 4.9 ms  |
+| C (-O3)     | 0.8 ms  |
 
-3.8× speedup over the interpreter. JIT compiled 1 trace, 0 aborts.
+3.7× speedup over the interpreter. JIT compiled 1 trace, 0 aborts.
 
 `bench_for.wren` — sum 1..1000000 via `for i in range`:
 
