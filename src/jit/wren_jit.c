@@ -133,7 +133,16 @@ void wrenJitStartRecording(WrenJitState* jit, uint8_t* pc)
     if (!ir) return;
     irBufferInit(ir);
 
-    // Emit the loop header marker as the first node.
+    // Pre-allocate NOP slots for the variable-promotion pass.
+    // These slots (indices 0..JIT_PRE_HEADER_SLOTS-1) precede the loop
+    // header and can be converted to LOAD+PHI pairs by irOptPromoteLoopVars.
+    // JIT_PRE_HEADER_SLOTS must be even; irOptPromoteLoopVars uses 2 slots
+    // per promoted variable (one for the moved LOAD, one for the PHI).
+    for (int _k = 0; _k < JIT_PRE_HEADER_SLOTS; _k++) {
+        irEmit(ir, IR_NOP, IR_NONE, IR_NONE, IR_TYPE_VOID);
+    }
+
+    // Emit the loop header marker.
     irEmitLoopHeader(ir);
 
     jit->state = JIT_STATE_RECORDING;
@@ -243,10 +252,18 @@ void wrenJitMarkRoots(WrenVM* vm, WrenJitState* jit)
 JitTrace* wrenJitCompileAndStore(WrenVM* vm, WrenJitState* jit,
                                    ObjFiber* fiber, void* framePtr)
 {
-    (void)fiber; (void)framePtr;
+    (void)framePtr;
 
     if (!jit || (jit->state != JIT_STATE_RECORDING &&
                  jit->state != JIT_STATE_COMPILING)) return NULL;
+
+    // Compute module variables base for offset-based codegen.
+    void* modVarsBase = NULL;
+    if (fiber && fiber->numFrames > 0) {
+        CallFrame* frame = &fiber->frames[fiber->numFrames - 1];
+        if (frame->closure && frame->closure->fn && frame->closure->fn->module)
+            modVarsBase = (void*)frame->closure->fn->module->variables.data;
+    }
 
     // Transition out of recording state.
     jit->state = JIT_STATE_IDLE;
@@ -269,16 +286,27 @@ JitTrace* wrenJitCompileAndStore(WrenVM* vm, WrenJitState* jit,
     }
 
     // Run optimizer.
+    fprintf(stderr, "[JIT] DEBUG: before irOptimize, count=%u\n", ir->count);
     irOptimize(ir);
+    fprintf(stderr, "[JIT] DEBUG: after irOptimize, count=%u\n", ir->count);
 
     // Register allocation.
     RegAllocState ra;
+    fprintf(stderr, "[JIT] DEBUG: regAllocInit\n");
     regAllocInit(&ra, (int)ir->count);
+    fprintf(stderr, "[JIT] DEBUG: regAllocComputeRanges\n");
     regAllocComputeRanges(&ra, ir);
+    fprintf(stderr, "[JIT] DEBUG: regAllocRun\n");
     regAllocRun(&ra);
+    fprintf(stderr, "[JIT] DEBUG: regAlloc done, ranges=%d\n", ra.num_ranges);
+
+    // Dump IR if requested.
+    if (getenv("WREN_JIT_DUMP_IR")) irBufferDump(ir);
 
     // Code generation.  (ir is part of the recorder struct, not heap-allocated.)
-    JitTrace* trace = wrenJitCodegen(vm, ir, &ra, jit->anchor_pc);
+    fprintf(stderr, "[JIT] DEBUG: wrenJitCodegen start\n");
+    JitTrace* trace = wrenJitCodegen(vm, ir, &ra, jit->anchor_pc, modVarsBase);
+    fprintf(stderr, "[JIT] DEBUG: wrenJitCodegen done, trace=%p\n", (void*)trace);
     regAllocFree(&ra);
 
     if (!trace) {

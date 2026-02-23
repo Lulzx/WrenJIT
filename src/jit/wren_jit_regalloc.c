@@ -234,9 +234,12 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
 
     // Pass 3: Handle PHI nodes - their live ranges span from the loop header
     //         to the loop back edge (or end of buffer).
+    uint16_t loop_header = IR_NONE;
     uint16_t loop_end = buf->count > 0 ? buf->count - 1 : 0;
     for (uint16_t i = 0; i < buf->count; i++) {
         const IRNode* n = &buf->nodes[i];
+        if (n->op == IR_LOOP_HEADER && loop_header == IR_NONE)
+            loop_header = i;
         if (n->op == IR_LOOP_BACK) {
             loop_end = i;
             break;
@@ -258,6 +261,23 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
             if (n->op2 != IR_NONE && n->op2 < buf->count && defined[n->op2]) {
                 if (loop_end > range_end[n->op2])
                     range_end[n->op2] = loop_end;
+            }
+        }
+    }
+
+    // Pass 4: Extend loop-spanning ranges.
+    // Any value defined before the loop header but used inside the loop body
+    // must remain live until loop_end — the loop executes multiple iterations,
+    // so the register must not be reused by another value mid-loop.
+    if (loop_header != IR_NONE) {
+        for (uint16_t id = 0; id < buf->count; id++) {
+            if (!defined[id])
+                continue;
+            // Defined before (or at) the loop header, used inside the loop.
+            if (range_start[id] <= loop_header &&
+                range_end[id] >= loop_header &&
+                range_end[id] < loop_end) {
+                range_end[id] = loop_end;
             }
         }
     }

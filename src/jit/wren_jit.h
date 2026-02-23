@@ -20,6 +20,12 @@ typedef struct sObjClass ObjClass;
 // Maximum traces in the cache
 #define JIT_MAX_TRACES 1024
 
+// Number of NOP slots pre-allocated before the loop header so that
+// irOptPromoteLoopVars can fill them with LOAD + UNBOX + PHI tuples.
+// Must be even; irOptPromoteLoopVars uses 3 slots per promoted variable
+// (LOAD, UNBOX, PHI). 32 handles up to 10 loop-carried module variables.
+#define JIT_PRE_HEADER_SLOTS 32
+
 // Trace execution function type
 // Returns 0 on success, or exit index (1-based) on side exit
 // Args: vm, fiber, stackStart, moduleVarsData (Value* to module variables array)

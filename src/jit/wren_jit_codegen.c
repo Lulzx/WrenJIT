@@ -142,7 +142,7 @@ static void getFP(const RegAllocState* ra, uint16_t ssaId,
 // ---------------------------------------------------------------------------
 
 JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
-                         uint8_t* anchorPC)
+                         uint8_t* anchorPC, void* modVarsBase)
 {
     if (!ir || ir->count == 0) return NULL;
 
@@ -951,6 +951,41 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
         }
 
         case IR_LOOP_BACK: {
+            // Emit back-edge copies: phi_reg = op2_reg for all pre-header PHIs.
+            uint16_t hdr = ir->loop_header;
+            for (uint16_t p = 0; p < hdr && p < ir->count; p++) {
+                const IRNode* phi = &ir->nodes[p];
+                if ((phi->flags & IR_FLAG_DEAD) || phi->op != IR_PHI) continue;
+                if (phi->op2 == IR_NONE || phi->op2 >= ir->count) continue;
+                if (phi->type == IR_TYPE_NUM) {
+                    int srcReg, srcMem; sljit_sw srcOff;
+                    int dstReg, dstMem; sljit_sw dstOff;
+                    getFP(ra, phi->op2, &srcReg, &srcMem, &srcOff);
+                    getFP(ra, phi->id,  &dstReg, &dstMem, &dstOff);
+                    int sr = srcReg; sljit_sw sw = srcOff;
+                    if (srcMem) {
+                        sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR0, 0, srcReg, srcOff);
+                        sr = SLJIT_FR0; sw = 0;
+                    }
+                    if (dstMem) {
+                        sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR1, 0, sr, sw);
+                        sljit_emit_fop1(C, SLJIT_MOV_F64, dstReg, dstOff, SLJIT_FR1, 0);
+                    } else {
+                        sljit_emit_fop1(C, SLJIT_MOV_F64, dstReg, 0, sr, sw);
+                    }
+                } else {
+                    int srcReg, srcMem; sljit_sw srcOff;
+                    int dstReg, dstMem; sljit_sw dstOff;
+                    getGP(ra, phi->op2, &srcReg, &srcMem, &srcOff);
+                    getGP(ra, phi->id,  &dstReg, &dstMem, &dstOff);
+                    int sr = srcReg; sljit_sw sw = srcOff;
+                    if (srcMem) {
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, srcOff);
+                        sr = SLJIT_R0; sw = 0;
+                    }
+                    sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff, sr, sw);
+                }
+            }
             if (loopHeaderLabel) {
                 struct sljit_jump* backJump = sljit_emit_jump(C, SLJIT_JUMP);
                 sljit_set_label(backJump, loopHeaderLabel);
@@ -959,10 +994,40 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
         }
 
         // ----- PHI, SNAPSHOT, SIDE_EXIT -----
-        case IR_PHI:
-            // PHI nodes produce no code. The register allocator ensures
-            // both inputs and the output share the same register.
+        case IR_PHI: {
+            // Emit initial assignment: phi_reg = op1_reg (pre-loop value).
+            // At LOOP_BACK we emit phi_reg = op2_reg (back-edge value).
+            if (n->op1 == IR_NONE || n->op1 >= ir->count) break;
+            if (n->type == IR_TYPE_NUM) {
+                int srcReg, srcMem; sljit_sw srcOff;
+                int dstReg, dstMem; sljit_sw dstOff;
+                getFP(ra, n->op1, &srcReg, &srcMem, &srcOff);
+                getFP(ra, n->id,  &dstReg, &dstMem, &dstOff);
+                int sr = srcReg; sljit_sw sw = srcOff;
+                if (srcMem) {
+                    sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR0, 0, srcReg, srcOff);
+                    sr = SLJIT_FR0; sw = 0;
+                }
+                if (dstMem) {
+                    sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR1, 0, sr, sw);
+                    sljit_emit_fop1(C, SLJIT_MOV_F64, dstReg, dstOff, SLJIT_FR1, 0);
+                } else {
+                    sljit_emit_fop1(C, SLJIT_MOV_F64, dstReg, 0, sr, sw);
+                }
+            } else {
+                int srcReg, srcMem; sljit_sw srcOff;
+                int dstReg, dstMem; sljit_sw dstOff;
+                getGP(ra, n->op1, &srcReg, &srcMem, &srcOff);
+                getGP(ra, n->id,  &dstReg, &dstMem, &dstOff);
+                int sr = srcReg; sljit_sw sw = srcOff;
+                if (srcMem) {
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, srcOff);
+                    sr = SLJIT_R0; sw = 0;
+                }
+                sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff, sr, sw);
+            }
             break;
+        }
 
         case IR_SNAPSHOT:
             // Snapshot nodes produce no code themselves.
@@ -1113,46 +1178,75 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
         }
 
         case IR_LOAD_MODULE_VAR: {
-            // Load a Value from an absolute address (imm.ptr).
-            // The recorder stores the address of the module variable directly.
-            void* varAddr = n->imm.ptr;
+            // Load a Value from the module variables array.
+            // Fast path (when modVarsBase is known): use REG_MOD_VARS + offset
+            // (single instruction on ARM64).  Fallback: absolute pointer.
             int dstReg, dstMem; sljit_sw dstOff;
             getGP(ra, n->id, &dstReg, &dstMem, &dstOff);
 
-            // Load absolute address into R0, then load value from it.
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                           SLJIT_IMM, (sljit_sw)(uintptr_t)varAddr);
-            if (dstMem) {
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
-                               SLJIT_MEM1(SLJIT_R0), 0);
-                sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff, SLJIT_R1, 0);
+            if (modVarsBase != NULL) {
+                // Compute byte offset from module vars base.
+                sljit_sw mvOff = (sljit_sw)(
+                    ((char*)n->imm.ptr - (char*)modVarsBase));
+                if (dstMem) {
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                   SLJIT_MEM1(REG_MOD_VARS), mvOff);
+                    sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff,
+                                   SLJIT_R0, 0);
+                } else {
+                    sljit_emit_op1(C, SLJIT_MOV, dstReg, 0,
+                                   SLJIT_MEM1(REG_MOD_VARS), mvOff);
+                }
             } else {
-                sljit_emit_op1(C, SLJIT_MOV, dstReg, 0,
-                               SLJIT_MEM1(SLJIT_R0), 0);
+                // Fallback: load absolute address into R0, then dereference.
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_IMM, (sljit_sw)(uintptr_t)n->imm.ptr);
+                if (dstMem) {
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                                   SLJIT_MEM1(SLJIT_R0), 0);
+                    sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff, SLJIT_R1, 0);
+                } else {
+                    sljit_emit_op1(C, SLJIT_MOV, dstReg, 0,
+                                   SLJIT_MEM1(SLJIT_R0), 0);
+                }
             }
             break;
         }
 
         case IR_STORE_MODULE_VAR: {
-            // Store a Value to an absolute address (imm.ptr).
+            // Store a Value to the module variables array.
             // op1 = SSA value to store.
-            void* varAddr = n->imm.ptr;
             uint16_t valId = n->op1;
             if (valId == IR_NONE) break;
 
             int srcReg, srcMem; sljit_sw srcOff;
             getGP(ra, valId, &srcReg, &srcMem, &srcOff);
 
-            // Load absolute address into R0, then store value to it.
-            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                           SLJIT_IMM, (sljit_sw)(uintptr_t)varAddr);
-            if (srcMem) {
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, srcReg, srcOff);
-                sljit_emit_op1(C, SLJIT_MOV,
-                               SLJIT_MEM1(SLJIT_R0), 0, SLJIT_R1, 0);
+            if (modVarsBase != NULL) {
+                sljit_sw mvOff = (sljit_sw)(
+                    ((char*)n->imm.ptr - (char*)modVarsBase));
+                if (srcMem) {
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, srcOff);
+                    sljit_emit_op1(C, SLJIT_MOV,
+                                   SLJIT_MEM1(REG_MOD_VARS), mvOff,
+                                   SLJIT_R0, 0);
+                } else {
+                    sljit_emit_op1(C, SLJIT_MOV,
+                                   SLJIT_MEM1(REG_MOD_VARS), mvOff,
+                                   srcReg, 0);
+                }
             } else {
-                sljit_emit_op1(C, SLJIT_MOV,
-                               SLJIT_MEM1(SLJIT_R0), 0, srcReg, 0);
+                // Fallback: absolute pointer.
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_IMM, (sljit_sw)(uintptr_t)n->imm.ptr);
+                if (srcMem) {
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, srcReg, srcOff);
+                    sljit_emit_op1(C, SLJIT_MOV,
+                                   SLJIT_MEM1(SLJIT_R0), 0, SLJIT_R1, 0);
+                } else {
+                    sljit_emit_op1(C, SLJIT_MOV,
+                                   SLJIT_MEM1(SLJIT_R0), 0, srcReg, 0);
+                }
             }
             break;
         }

@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -641,6 +642,21 @@ void irOptLICM(IRBuffer* buf)
             if (n->op == IR_PHI) continue;
             if (n->flags & IR_FLAG_INVARIANT) continue;
 
+            // Memory reads whose slot/var is written inside the loop body are
+            // NOT invariant — hoisting them would cause stale reads on the
+            // next iteration (classic LICM alias check).
+            if (n->op == IR_LOAD_STACK) {
+                uint16_t slot = n->imm.mem.slot;
+                bool written = false;
+                for (uint16_t k = header + 1; k < back && !written; k++) {
+                    const IRNode* s = &buf->nodes[k];
+                    if (s->flags & IR_FLAG_DEAD) continue;
+                    if (s->op == IR_STORE_STACK && s->imm.mem.slot == slot)
+                        written = true;
+                }
+                if (written) continue; // leave not-invariant
+            }
+
             bool invariant = true;
 
             if (n->op1 != IR_NONE && n->op1 < buf->count) {
@@ -648,12 +664,19 @@ void irOptLICM(IRBuffer* buf)
                     IRNode* o = &buf->nodes[n->op1];
                     if (!(o->flags & IR_FLAG_INVARIANT) && !isConst(o->op))
                         invariant = false;
+                } else {
+                    // Pre-header: PHI nodes change each iteration — not invariant.
+                    if (buf->nodes[n->op1].op == IR_PHI)
+                        invariant = false;
                 }
             }
             if (n->op2 != IR_NONE && n->op2 < buf->count) {
                 if (n->op2 >= header) {
                     IRNode* o = &buf->nodes[n->op2];
                     if (!(o->flags & IR_FLAG_INVARIANT) && !isConst(o->op))
+                        invariant = false;
+                } else {
+                    if (buf->nodes[n->op2].op == IR_PHI)
                         invariant = false;
                 }
             }
@@ -706,8 +729,10 @@ void irOptGuardHoist(IRBuffer* buf)
         if (n->flags & IR_FLAG_HOISTED) continue;
         if (n->op1 == IR_NONE) continue;
 
-        // The guard's operand must be defined before the loop.
+        // The guard's operand must be defined before the loop,
+        // but NOT be a PHI (which changes each iteration).
         if (n->op1 >= header) continue;
+        if (buf->nodes[n->op1].op == IR_PHI) continue;
 
         // Find an empty NOP slot before the header.
         for (uint16_t j = 0; j < header; j++) {
@@ -1126,12 +1151,169 @@ void irOptDCE(IRBuffer* buf)
 }
 
 // ===========================================================================
+// Pass 0: Loop Variable Promotion (PHI insertion, ~150 LOC)
+//
+// For each module variable that is both read and written inside the loop:
+//   1. Emit LOAD_MODULE_VAR in a pre-header NOP slot (initial load, once).
+//   2. Emit UNBOX_NUM of that load in the next pre-header NOP slot.
+//   3. Emit PHI(unbox_init, arithmetic_result) in the third NOP slot.
+//   4. Replace uses of the in-loop UNBOX_NUM with the PHI.
+//   5. Kill the original in-loop LOAD_MODULE_VAR and UNBOX_NUM.
+//
+// This converts memory-based loop variables into register-resident SSA values
+// and creates the PHI structure needed by irOptIVTypeInference (Pass 12).
+//
+// Preconditions:
+//   - buf->loop_header points to IR_LOOP_HEADER.
+//   - Pre-header NOP slots exist at indices [0, loop_header).
+//   - This pass runs BEFORE all other passes (so BOX_NUM is still present).
+// ===========================================================================
+void irOptPromoteLoopVars(IRBuffer* buf)
+{
+    if (!buf || buf->count == 0) return;
+
+    uint16_t header = findLoopHeader(buf);
+    if (header == IR_NONE || header == 0) return;
+
+    uint16_t back = findLoopBack(buf);
+    if (back == IR_NONE) return;
+
+    // Cursor into the pre-header NOP slot pool.
+    uint16_t nextNop = 0;
+
+    // Track which variable pointers have already been promoted so that
+    // duplicate LOAD_MODULE_VAR nodes for the same variable (emitted by the
+    // recorder before GVN runs) don't create extra PHI triples.
+    void*    promoted_ptrs[32 / 3 + 1];  /* sized for JIT_PRE_HEADER_SLOTS=32 */
+    int      promoted_count = 0;
+
+    for (uint16_t i = header + 1; i < back; i++) {
+        IRNode* loadN = &buf->nodes[i];
+        if (loadN->flags & IR_FLAG_DEAD) continue;
+        if (loadN->op != IR_LOAD_MODULE_VAR) continue;
+
+        void* var_ptr = loadN->imm.ptr;
+
+        // Skip if this variable was already promoted by an earlier LOAD node.
+        bool already_promoted = false;
+        for (int pp = 0; pp < promoted_count; pp++) {
+            if (promoted_ptrs[pp] == var_ptr) { already_promoted = true; break; }
+        }
+        if (already_promoted) continue;
+
+        // Find a single UNBOX_NUM that directly consumes this LOAD.
+        // The recorder emits irEmitUnbox(load_ssa) which is UNBOX_NUM(load_id).
+        uint16_t unbox_id = IR_NONE;
+        for (uint16_t u = header + 1; u < back; u++) {
+            if (buf->nodes[u].op == IR_UNBOX_NUM && buf->nodes[u].op1 == i) {
+                unbox_id = u;
+                break;
+            }
+        }
+        if (unbox_id == IR_NONE) continue;
+
+        // Find the matching STORE_MODULE_VAR for the same variable.
+        uint16_t store_id = IR_NONE;
+        for (uint16_t s = header + 1; s < back; s++) {
+            const IRNode* sn = &buf->nodes[s];
+            if (sn->flags & IR_FLAG_DEAD) continue;
+            if (sn->op == IR_STORE_MODULE_VAR && sn->imm.ptr == var_ptr) {
+                store_id = s;
+                break;
+            }
+        }
+        if (store_id == IR_NONE) continue;
+
+        // The stored value must be BOX_NUM(back_val) so we can recover the
+        // unboxed arithmetic result as the PHI's back-edge value.
+        uint16_t store_val_id = buf->nodes[store_id].op1;
+        if (store_val_id == IR_NONE || store_val_id >= buf->count) continue;
+        if (buf->nodes[store_val_id].op != IR_BOX_NUM) continue;
+
+        uint16_t back_val_id = buf->nodes[store_val_id].op1;
+        if (back_val_id == IR_NONE || back_val_id >= buf->count) continue;
+
+        // Need 3 consecutive NOP slots in the pre-header.
+        while (nextNop < header && buf->nodes[nextNop].op != IR_NOP) nextNop++;
+        uint16_t j0 = nextNop;
+        uint16_t j1 = (uint16_t)(nextNop + 1);
+        uint16_t j2 = (uint16_t)(nextNop + 2);
+        if (j2 >= header) continue;
+        if (buf->nodes[j0].op != IR_NOP ||
+            buf->nodes[j1].op != IR_NOP ||
+            buf->nodes[j2].op != IR_NOP) continue;
+        nextNop += 3;
+
+        // Record this variable as promoted so duplicate LOADs are skipped.
+        if (promoted_count < (int)(sizeof(promoted_ptrs) / sizeof(promoted_ptrs[0])))
+            promoted_ptrs[promoted_count++] = var_ptr;
+
+        // j0: copy of LOAD_MODULE_VAR, placed in pre-header.
+        buf->nodes[j0] = *loadN;
+        buf->nodes[j0].id    = j0;
+        buf->nodes[j0].flags = 0;
+
+        // j1: UNBOX_NUM(j0), type=NUM — the initial unboxed value.
+        {
+            IRNode* j1n = &buf->nodes[j1];
+            j1n->op    = IR_UNBOX_NUM;
+            j1n->id    = j1;
+            j1n->op1   = j0;
+            j1n->op2   = IR_NONE;
+            j1n->type  = IR_TYPE_NUM;
+            j1n->flags = 0;
+            memset(&j1n->imm, 0, sizeof(j1n->imm));
+        }
+
+        // j2: PHI(j1, back_val_id), type=NUM — the loop-carried value.
+        {
+            IRNode* j2n = &buf->nodes[j2];
+            j2n->op    = IR_PHI;
+            j2n->id    = j2;
+            j2n->op1   = j1;
+            j2n->op2   = back_val_id;
+            j2n->type  = IR_TYPE_NUM;
+            j2n->flags = 0;
+            memset(&j2n->imm, 0, sizeof(j2n->imm));
+        }
+
+        // Replace ALL in-loop LOAD_MODULE_VAR(var_ptr) nodes with j0, and
+        // ALL UNBOX_NUM nodes that consume any such LOAD with j2.  A single
+        // trace can load the same module variable multiple times per iteration
+        // (e.g. once for the loop condition, once per operand in the body), so
+        // we must sweep the entire loop body rather than handling only the one
+        // LOAD/UNBOX pair we used to discover the back-edge value.
+        for (uint16_t k = header + 1; k < back; k++) {
+            IRNode* kn = &buf->nodes[k];
+            if (kn->flags & IR_FLAG_DEAD) continue;
+
+            if (kn->op == IR_LOAD_MODULE_VAR && kn->imm.ptr == var_ptr) {
+                replaceUses(buf, k, j0);
+                killNode(kn);
+                continue;
+            }
+        }
+        // Second sub-pass: UNBOXes whose source was one of those LOADs are now
+        // UNBOX_NUM(j0) after replaceUses above.  Redirect them to j2.
+        for (uint16_t k = header + 1; k < back; k++) {
+            IRNode* kn = &buf->nodes[k];
+            if (kn->flags & IR_FLAG_DEAD) continue;
+            if (kn->op == IR_UNBOX_NUM && kn->op1 == j0) {
+                replaceUses(buf, k, j2);
+                killNode(kn);
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Master optimization pipeline
 // ===========================================================================
 void irOptimize(IRBuffer* buf)
 {
     if (buf == NULL || buf->count == 0) return;
 
+    irOptPromoteLoopVars(buf);     // 0. Promote loop vars to register PHIs
     irOptBoxUnboxElim(buf);        // 1. Reduce box/unbox noise
     irOptRedundantGuardElim(buf);  // 2. Eliminate duplicate guards
     irOptConstPropFold(buf);       // 3. Fold constants, algebraic identities

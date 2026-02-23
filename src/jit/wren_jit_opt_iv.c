@@ -83,11 +83,14 @@ void irOptIVTypeInference(IRBuffer* buf)
             const IRNode* preNode = &buf->nodes[pre];
             const IRNode* backNode = &buf->nodes[back];
 
-            // Pre-loop value must be an integer constant.
+            // Pre-loop value must be an integer constant, INT, or NUM type.
+            // We accept NUM because irOptPromoteLoopVars places UNBOX_NUM
+            // (type NUM) as the initial value in the pre-header PHI.
             if (!isIntegerConstNum(preNode) &&
-                preNode->type != IR_TYPE_INT) continue;
+                preNode->type != IR_TYPE_INT &&
+                preNode->type != IR_TYPE_NUM) continue;
 
-            // Back-edge must be ADD or SUB of (phi, const) or (const, phi).
+            // Back-edge must be ADD or SUB of (phi, const/int) or (const/int, phi).
             bool backIsIV = false;
             if (backNode->op == IR_ADD || backNode->op == IR_SUB) {
                 uint16_t b1 = backNode->op1;
@@ -95,14 +98,16 @@ void irOptIVTypeInference(IRBuffer* buf)
                 if (b1 == IR_NONE || b2 == IR_NONE) continue;
                 if (b1 >= buf->count || b2 >= buf->count) continue;
 
-                bool phiIsLHS = (b1 == i) ||
-                                (buf->nodes[b1].op == IR_PHI && b1 == i);
-                bool phiIsRHS = (b2 == i) ||
-                                (buf->nodes[b2].op == IR_PHI && b2 == i);
-                const IRNode* step = phiIsLHS ? &buf->nodes[b2]
-                                              : &buf->nodes[b1];
-                if ((phiIsLHS || phiIsRHS) && isIntegerConstNum(step)) {
-                    backIsIV = true;
+                bool phiIsLHS = (b1 == i);
+                bool phiIsRHS = (b2 == i);
+                uint16_t step_id = phiIsLHS ? b2 : b1;
+                const IRNode* step = &buf->nodes[step_id];
+
+                if (phiIsLHS || phiIsRHS) {
+                    // Accept constant-integer step or INT-typed step.
+                    if (isIntegerConstNum(step) || isIntType(buf, step_id)) {
+                        backIsIV = true;
+                    }
                 }
             }
 
@@ -121,19 +126,32 @@ void irOptIVTypeInference(IRBuffer* buf)
             switch (n->op) {
                 case IR_ADD:
                 case IR_SUB:
-                case IR_MUL:
-                    if (n->op1 != IR_NONE && n->op2 != IR_NONE &&
-                        isIntType(buf, n->op1) && isIntType(buf, n->op2)) {
+                case IR_MUL: {
+                    if (n->op1 == IR_NONE || n->op2 == IR_NONE) break;
+                    IRNode* a = &buf->nodes[n->op1];
+                    IRNode* b = &buf->nodes[n->op2];
+                    bool aInt = isIntType(buf, n->op1) ||
+                                (a->op == IR_CONST_NUM && isIntegerConstNum(a));
+                    bool bInt = isIntType(buf, n->op2) ||
+                                (b->op == IR_CONST_NUM && isIntegerConstNum(b));
+                    if (aInt && bInt) {
+                        // Promote integer-valued CONST_NUM operands to CONST_INT
+                        // so the codegen can use the GP (integer) code path.
+                        if (a->op == IR_CONST_NUM && isIntegerConstNum(a)) {
+                            a->op      = IR_CONST_INT;
+                            a->imm.i64 = (int64_t)a->imm.num;
+                            a->type    = IR_TYPE_INT;
+                        }
+                        if (b->op == IR_CONST_NUM && isIntegerConstNum(b)) {
+                            b->op      = IR_CONST_INT;
+                            b->imm.i64 = (int64_t)b->imm.num;
+                            b->type    = IR_TYPE_INT;
+                        }
                         n->type = IR_TYPE_INT;
                         changed = true;
                     }
                     break;
-                // IR_CONST_NUM is intentionally NOT promoted here.
-                // CONST_NUM codegen uses getFP (FP register) regardless of
-                // type; promoting to IR_TYPE_INT would cause regalloc to
-                // assign a GP register, breaking the FP codegen path.
-                // When PHI-based IV promotion is fully wired, CONST_NUM will
-                // need a separate IR_CONST_INT opcode instead.
+                }
                 default:
                     break;
             }
@@ -157,7 +175,22 @@ void irOptIVTypeInference(IRBuffer* buf)
         }
     }
 
+    // --- Step 4b: backward — UNBOX_NUM that feeds op1 of INT PHI → UNBOX_INT ---
+    for (uint16_t i = 0; i < buf->count; i++) {
+        const IRNode* phi = &buf->nodes[i];
+        if (phi->flags & IR_FLAG_DEAD) continue;
+        if (phi->op != IR_PHI || phi->type != IR_TYPE_INT) continue;
+        if (phi->op1 == IR_NONE || phi->op1 >= buf->count) continue;
+        IRNode* preVal = &buf->nodes[phi->op1];
+        if (!(preVal->flags & IR_FLAG_DEAD) && preVal->op == IR_UNBOX_NUM) {
+            preVal->op   = IR_UNBOX_INT;
+            preVal->type = IR_TYPE_INT;
+        }
+    }
+
     // --- Step 5: mark comparisons on INT operands ---
+    // Also promote integer-valued CONST_NUM operands to CONST_INT, same as
+    // step 3 does for arithmetic, so the codegen uses the integer compare path.
     for (uint16_t i = 0; i < buf->count; i++) {
         IRNode* n = &buf->nodes[i];
         if (n->flags & IR_FLAG_DEAD) continue;
@@ -168,12 +201,30 @@ void irOptIVTypeInference(IRBuffer* buf)
             case IR_LTE:
             case IR_GTE:
             case IR_EQ:
-            case IR_NEQ:
-                if (n->op1 != IR_NONE && n->op2 != IR_NONE &&
-                    isIntType(buf, n->op1) && isIntType(buf, n->op2)) {
+            case IR_NEQ: {
+                if (n->op1 == IR_NONE || n->op2 == IR_NONE) break;
+                if (n->op1 >= buf->count || n->op2 >= buf->count) break;
+                IRNode* a = &buf->nodes[n->op1];
+                IRNode* b = &buf->nodes[n->op2];
+                bool aInt = isIntType(buf, n->op1) ||
+                            (a->op == IR_CONST_NUM && isIntegerConstNum(a));
+                bool bInt = isIntType(buf, n->op2) ||
+                            (b->op == IR_CONST_NUM && isIntegerConstNum(b));
+                if (aInt && bInt) {
+                    if (a->op == IR_CONST_NUM && isIntegerConstNum(a)) {
+                        a->op      = IR_CONST_INT;
+                        a->imm.i64 = (int64_t)a->imm.num;
+                        a->type    = IR_TYPE_INT;
+                    }
+                    if (b->op == IR_CONST_NUM && isIntegerConstNum(b)) {
+                        b->op      = IR_CONST_INT;
+                        b->imm.i64 = (int64_t)b->imm.num;
+                        b->type    = IR_TYPE_INT;
+                    }
                     n->type = IR_TYPE_INT; // signal integer comparison to codegen
                 }
                 break;
+            }
             default:
                 break;
         }

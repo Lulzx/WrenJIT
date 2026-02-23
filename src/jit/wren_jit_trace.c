@@ -118,6 +118,12 @@ void jitRecorderStart(WrenJitState* jit, uint8_t* anchor_pc, int num_slots)
     // Initialise the IR buffer.
     irBufferInit(&r->ir);
 
+    // Pre-allocate NOP slots before the loop header so that
+    // irOptPromoteLoopVars can fill them with LOAD+UNBOX+PHI tuples.
+    for (int _k = 0; _k < JIT_PRE_HEADER_SLOTS; _k++) {
+        irEmit(&r->ir, IR_NOP, IR_NONE, IR_NONE, IR_TYPE_VOID);
+    }
+
     // Emit the loop header node.
     irEmitLoopHeader(&r->ir);
 

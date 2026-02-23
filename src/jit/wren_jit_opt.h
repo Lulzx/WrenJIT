@@ -3,6 +3,13 @@
 
 #include "wren_jit_ir.h"
 
+// Pass 0: Promote loop-carried module variables to register PHI nodes.
+// Must be called before all other passes. Fills pre-header NOP slots
+// (allocated by wrenJitStartRecording) with LOAD + UNBOX_NUM + PHI tuples
+// and replaces in-loop UNBOX_NUM(LOAD_MODULE_VAR) with the PHI so that
+// IV type inference can fire and eliminate FP box/unbox overhead.
+void irOptPromoteLoopVars(IRBuffer* buf);
+
 // Run all optimization passes on the IR buffer.
 // Passes run in order:
 //   1. Box/unbox elimination

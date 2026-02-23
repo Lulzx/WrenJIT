@@ -25,24 +25,28 @@ SSA-form IR with the following node types:
 - Comparison: `LT`, `GT`, `LTE`, `GTE`, `EQ`, `NEQ`
 - Bitwise: `BAND`, `BOR`, `BXOR`, `BNOT`, `LSHIFT`, `RSHIFT`
 - Memory: `LOAD_STACK`, `STORE_STACK`, `LOAD_FIELD`, `STORE_FIELD`, `LOAD_MODULE_VAR`, `STORE_MODULE_VAR`
-- NaN-boxing: `BOX_NUM`, `UNBOX_NUM`, `BOX_OBJ`, `UNBOX_OBJ`, `BOX_BOOL`
+- NaN-boxing: `BOX_NUM`, `UNBOX_NUM`, `BOX_OBJ`, `UNBOX_OBJ`, `BOX_BOOL`, `BOX_INT`, `UNBOX_INT`
 - Guards: `GUARD_NUM`, `GUARD_CLASS`, `GUARD_TRUE`, `GUARD_FALSE`
 - Control: `LOOP_HEADER`, `LOOP_BACK`, `SNAPSHOT`, `SIDE_EXIT`, `PHI`
 
 ## Optimizer
 
-Ten passes run in sequence:
+Thirteen passes run in sequence:
 
-1. Box/unbox elimination — cancels adjacent `BOX(UNBOX(x))` pairs; removes `BOX_NUM` nodes whose only consumers are `UNBOX_NUM`
-2. Redundant guard elimination — bitset tracking per guard kind, reset at loop header
-3. Constant propagation and folding — algebraic identities, comparison folding
-4. GVN — hash-based CSE
-5. LICM — hoists loop-invariant computations to pre-header NOP slots
-6. Guard hoisting — moves type guards on pre-loop values before the loop
-7. Strength reduction — `x*2 → x+x`, `x/c → x*(1/c)`
-8. Bounds check elimination — removes redundant `GUARD_NUM` after arithmetic
-9. Escape analysis — scalar replacement and store-load forwarding for fields
-10. DCE — mark-sweep from side-effecting roots
+1. Loop variable promotion — replaces `LOAD_MODULE_VAR/STORE_MODULE_VAR` pairs for loop-carried variables with `PHI` nodes, keeping values in registers across iterations
+2. Box/unbox elimination — cancels adjacent `BOX(UNBOX(x))` pairs; removes `BOX_NUM` nodes whose only consumers are `UNBOX_NUM`
+3. Redundant guard elimination — bitset tracking per guard kind, reset at loop header
+4. Constant propagation and folding — algebraic identities, comparison folding
+5. GVN — hash-based CSE
+6. LICM — hoists loop-invariant computations to pre-header NOP slots (alias-safe: skips `LOAD_STACK` nodes whose slot is written in the loop body)
+7. Guard hoisting — moves type guards on pre-loop values before the loop
+8. Strength reduction — `x*2 → x+x`, `x/c → x*(1/c)`
+9. Bounds check elimination — removes redundant `GUARD_NUM` after arithmetic
+10. Escape analysis — scalar replacement and store-load forwarding for fields
+11. DCE — mark-sweep from side-effecting roots
+12. Guard elimination — proves and deletes loop-invariant guards; eliminates dispensable `STORE_STACK` nodes (Phase B)
+13. Integer IV type inference — detects integer induction variables (PHIs with integer constant steps), promotes arithmetic to integer GP operations, eliminates NaN-boxing overhead in tight loops
+14. DCE — re-sweep after passes 12–13
 
 ## Register allocator
 
@@ -54,25 +58,29 @@ frame when all registers in a class are live.
 
 ## Performance
 
+Measured on Apple M-series (ARM64). Times are the hot-loop body only (Wren
+`System.clock`); process startup and JIT compilation are excluded.
+
 `bench_sum.wren` — sum integers 0..999999 in a `while` loop:
 
 | mode        | time    |
 |-------------|---------|
-| interpreter | 18.3 ms |
-| JIT         | 4.9 ms  |
-| C (-O3)     | 0.8 ms  |
+| interpreter | ~24 ms  |
+| JIT         | ~2.0 ms |
+| C (-O3)     | ~0.4 ms |
 
-3.7× speedup over the interpreter. JIT compiled 1 trace, 0 aborts.
+~12× speedup over the interpreter. Integer IV inference keeps both loop
+variables (`sum`, `i`) in GP registers with no NaN-boxing overhead.
 
 `bench_for.wren` — sum 1..1000000 via `for i in range`:
 
-| mode        | time    | notes              |
-|-------------|---------|-------------------|
-| interpreter | 18.8 ms |                   |
-| JIT         | 19.9 ms | 16 aborts, 0 traces compiled |
+| mode        | time    |
+|-------------|---------|
+| interpreter | ~28 ms  |
+| JIT         | ~3.9 ms |
 
-Range-based `for` uses `CALL_1` on a non-`Num` receiver (the Range iterator);
-recording aborts and the interpreter handles the full loop.
+~7× speedup over the interpreter. Range iteration is inlined via monomorphic
+`CALL_1` widening (`jitTryWidenCall1`); no aborts.
 
 `bench_fib.wren` — recursive Fibonacci(35):
 
@@ -109,8 +117,8 @@ cmake -B build -DWREN_JIT=OFF
 
 ## Limitations
 
-- Only numeric (`Num`) method dispatch is traced. Range-based `for` loops and
-  method calls on objects abort recording.
+- Range-based `for` loops compile via monomorphic inlining; other object method
+  calls on non-`Num` receivers abort recording.
 - No OSR (on-stack replacement). The trace must be entered from the top of the
   loop.
 - No trace chaining. Each compiled trace covers exactly one loop.
@@ -122,7 +130,10 @@ cmake -B build -DWREN_JIT=OFF
 src/jit/
   wren_jit.c          trace cache, lifecycle, hot counting
   wren_jit_ir.c       IR construction and debug printing
-  wren_jit_opt.c      optimizer pipeline (10 passes)
+  wren_jit_opt.c           optimizer pipeline (14 passes)
+  wren_jit_opt_guardelim.c guard elimination + STORE_STACK liveness (pass 12)
+  wren_jit_opt_iv.c        integer IV type inference (pass 13)
+  wren_jit_trace_widen.c   monomorphic inlining for Range iteration
   wren_jit_regalloc.c linear scan register allocator
   wren_jit_codegen.c  SLJIT code generator
   wren_jit_trace.c    bytecode-to-IR recorder
