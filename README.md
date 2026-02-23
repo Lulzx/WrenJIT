@@ -85,11 +85,11 @@ variables (`sum`, `i`) in GP registers with no NaN-boxing overhead.
 
 `bench_fib.wren` — recursive Fibonacci(35):
 
-| mode        | time    | notes         |
-|-------------|---------|---------------|
-| interpreter | 645 ms  |               |
-| JIT         | 649 ms  | 0 traces compiled |
-| C (-O3)     | 29.6 ms |               |
+| mode        | time   | notes             |
+|-------------|--------|-------------------|
+| interpreter | 869 ms |                   |
+| JIT         | 880 ms | 0 traces compiled |
+| C (-O3)     | 19 ms  |                   |
 
 Recursive calls do not form a traceable hot loop; JIT has no effect.
 
