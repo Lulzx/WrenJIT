@@ -60,26 +60,27 @@ frame when all registers in a class are live.
 
 Measured on Apple M-series (ARM64). Times are the hot-loop body only (Wren
 `System.clock`); process startup and JIT compilation are excluded.
+Median of 5 runs.
 
 `bench_sum.wren` — sum integers 0..999999 in a `while` loop:
 
 | mode        | time    |
 |-------------|---------|
-| interpreter | ~24 ms  |
-| JIT         | ~2.0 ms |
-| C (-O3)     | ~0.4 ms |
+| interpreter | 28 ms   |
+| JIT         | 2.5 ms  |
+| C (-O3)     | 1.1 ms  |
 
-~12× speedup over the interpreter. Integer IV inference keeps both loop
+~11× speedup over the interpreter. Integer IV inference keeps both loop
 variables (`sum`, `i`) in GP registers with no NaN-boxing overhead.
 
 `bench_for.wren` — sum 1..1000000 via `for i in range`:
 
-| mode        | time    |
-|-------------|---------|
-| interpreter | ~28 ms  |
-| JIT         | ~3.9 ms |
+| mode        | time   |
+|-------------|--------|
+| interpreter | 27 ms  |
+| JIT         | 5.0 ms |
 
-~7× speedup over the interpreter. Range iteration is inlined via monomorphic
+~5× speedup over the interpreter. Range iteration is inlined via monomorphic
 `CALL_1` widening (`jitTryWidenCall1`); no aborts.
 
 `bench_fib.wren` — recursive Fibonacci(35):
