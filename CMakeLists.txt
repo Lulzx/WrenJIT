@@ -37,7 +37,10 @@ if(WREN_JIT)
         ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_ir.c
         ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_snapshot.c
         ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_trace.c
+        ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_trace_widen.c
         ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_opt.c
+        ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_opt_guardelim.c
+        ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_opt_iv.c
         ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_regalloc.c
         ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_codegen.c
         ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_memory.c

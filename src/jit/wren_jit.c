@@ -107,6 +107,7 @@ int wrenJitExecute(WrenVM* vm, JitTrace* trace)
 
     if (result != 0) {
         trace->exit_count++;
+        if (vm && vm->jit) vm->jit->total_exits++;
     }
 
     return result;
@@ -309,5 +310,7 @@ void wrenJitRestoreExit(WrenVM* vm, WrenJitState* jit,
     JitSnapshot* snap = &trace->snapshots[exitIdx];
     CallFrame* frame = &fiber->frames[fiber->numFrames - 1];
     frame->ip = snap->resume_pc;
-    // Stack values were already written back by the side-exit stub.
+    // Restore the stack top to the depth captured at the snapshot.
+    // The side-exit stub already wrote all live SSA values back to the stack.
+    fiber->stackTop = frame->stackStart + snap->stack_depth;
 }

@@ -1061,7 +1061,16 @@ void irOptDCE(IRBuffer* buf)
 
         bool isRoot = false;
         switch (n->op) {
-            case IR_STORE_STACK:
+            case IR_STORE_STACK: {
+                // irOptGuardElim Phase B pre-marks dispensable STORE_STACK
+                // nodes as IR_FLAG_DEAD. Any STORE_STACK that Phase B kept
+                // alive is treated as an unconditional root here so that DCE
+                // preserves it (e.g., loop-variable stores needed by LOAD_STACK
+                // on the next iteration via LOOP_BACK).
+                if (n->flags & IR_FLAG_DEAD) break;
+                isRoot = true;
+                break;
+            }
             case IR_STORE_FIELD:
             case IR_STORE_MODULE_VAR:
             case IR_SIDE_EXIT:
@@ -1133,4 +1142,7 @@ void irOptimize(IRBuffer* buf)
     irOptBoundsCheckElim(buf);     // 8. Eliminate redundant bounds checks
     irOptEscapeAnalysis(buf);      // 9. Scalar replacement + store-load fwd
     irOptDCE(buf);                 // 10. Sweep dead code
+    irOptGuardElim(buf);           // 11. Prove-and-delete loop-invariant guards
+    irOptIVTypeInference(buf);     // 12. Integer induction variable promotion
+    irOptDCE(buf);                 // 13. Re-sweep after new eliminations
 }

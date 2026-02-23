@@ -252,6 +252,8 @@ const char* irOpName(IROp op)
     case IR_BOX_OBJ:        return "BOX_OBJ";
     case IR_UNBOX_OBJ:      return "UNBOX_OBJ";
     case IR_BOX_BOOL:       return "BOX_BOOL";
+    case IR_UNBOX_INT:      return "UNBOX_INT";
+    case IR_BOX_INT:        return "BOX_INT";
     case IR_GUARD_NUM:      return "GUARD_NUM";
     case IR_GUARD_CLASS:    return "GUARD_CLASS";
     case IR_GUARD_TRUE:     return "GUARD_TRUE";

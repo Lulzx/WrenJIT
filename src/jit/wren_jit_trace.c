@@ -1,4 +1,5 @@
 #include "wren_jit_trace.h"
+#include "wren_jit_trace_widen.h"
 #include "wren_jit.h"
 
 // Include Wren VM headers for access to Code enum, Value manipulation
@@ -248,6 +249,11 @@ bool jitRecorderStep(WrenJitState* jit, WrenVM* vm, uint8_t* ip)
             jitRecorderAbort(jit, "untracked value at STORE_LOCAL");
             return false;
         }
+        // Write back to the interpreter stack slot so that LOOP_BACK sees
+        // the updated value on re-entry at LOOP_HEADER (LOAD_STACK).
+        // Phase B in irOptGuardElim will prune stores whose slot is not
+        // reloaded in the loop body.
+        irEmitStore(&r->ir, (uint16_t)dst_slot, ssa);
         slotSet(r, dst_slot, ssa);
         break;
     }
@@ -397,6 +403,7 @@ bool jitRecorderStep(WrenJitState* jit, WrenVM* vm, uint8_t* ip)
             slotSet(r, recv_slot, boxed);
             // stack_top stays the same.
         } else {
+            if (jitTryWidenCall0(jit, vm, stackStart, symbol, ip)) break;
             jitRecorderAbort(jit, "unsupported CALL_0 receiver type");
             return false;
         }
@@ -465,6 +472,7 @@ bool jitRecorderStep(WrenJitState* jit, WrenVM* vm, uint8_t* ip)
             r->slot_live[r->stack_top] = false;
             slotSet(r, recv_slot, boxed);
         } else {
+            if (jitTryWidenCall1(jit, vm, stackStart, symbol, ip)) break;
             jitRecorderAbort(jit, "unsupported CALL_1 receiver type");
             return false;
         }

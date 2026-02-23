@@ -62,6 +62,8 @@ typedef enum {
     IR_BOX_OBJ,          // Obj* -> Value
     IR_UNBOX_OBJ,        // Value -> Obj*
     IR_BOX_BOOL,         // native bool (0/1) -> Wren Value (FALSE_VAL or TRUE_VAL)
+    IR_UNBOX_INT,        // NaN-tagged Value -> raw int64 (for integer IVs)
+    IR_BOX_INT,          // raw int64 -> NaN-tagged Value (for integer IVs)
 
     // Guards (type checks with side exit)
     IR_GUARD_NUM,        // assert value is a number

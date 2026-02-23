@@ -15,6 +15,8 @@
 //   8. Bounds check elimination
 //   9. Escape analysis
 //  10. Dead code elimination
+//  11. Guard elimination (prove-and-delete loop-invariant guards)
+//  12. IV type inference (integer induction variable promotion)
 void irOptimize(IRBuffer* buf);
 
 // Individual passes (exposed for testing / selective use).
@@ -28,5 +30,7 @@ void irOptStrengthReduce(IRBuffer* buf);
 void irOptBoundsCheckElim(IRBuffer* buf);
 void irOptEscapeAnalysis(IRBuffer* buf);
 void irOptDCE(IRBuffer* buf);
+void irOptGuardElim(IRBuffer* buf);
+void irOptIVTypeInference(IRBuffer* buf);
 
 #endif // wren_jit_opt_h

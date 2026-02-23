@@ -322,26 +322,34 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             sljit_sw dstOFP;
             getFP(ra, n->id, &dstReg, &dstMem, &dstOFP);
 
-            // Store GP value to temp area, then load as f64.
-            if (srcMem) {
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, srcOff);
-                sljit_emit_op1(C, SLJIT_MOV,
-                               SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff,
-                               SLJIT_R0, 0);
+            // Fast path: both operands in registers — use sljit_emit_fcopy
+            // (maps to FMOV on ARM64, no memory round-trip).
+            if (!srcMem && !dstMem) {
+                sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, dstReg, srcReg);
+            } else if (!srcMem && dstMem) {
+                sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, srcReg);
+                sljit_emit_fop1(C, SLJIT_MOV_F64, dstReg, dstOFP, SLJIT_FR0, 0);
             } else {
-                sljit_emit_op1(C, SLJIT_MOV,
-                               SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff,
-                               srcReg, 0);
-            }
-
-            if (dstMem) {
-                sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR0, 0,
-                                SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff);
-                sljit_emit_fop1(C, SLJIT_MOV_F64, dstReg, dstOFP,
-                                SLJIT_FR0, 0);
-            } else {
-                sljit_emit_fop1(C, SLJIT_MOV_F64, dstReg, 0,
-                                SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff);
+                // Slow path: source is spilled — use temp area.
+                if (srcMem) {
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, srcOff);
+                    sljit_emit_op1(C, SLJIT_MOV,
+                                   SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff,
+                                   SLJIT_R0, 0);
+                } else {
+                    sljit_emit_op1(C, SLJIT_MOV,
+                                   SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff,
+                                   srcReg, 0);
+                }
+                if (dstMem) {
+                    sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR0, 0,
+                                    SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff);
+                    sljit_emit_fop1(C, SLJIT_MOV_F64, dstReg, dstOFP,
+                                    SLJIT_FR0, 0);
+                } else {
+                    sljit_emit_fop1(C, SLJIT_MOV_F64, dstReg, 0,
+                                    SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff);
+                }
             }
             break;
         }
@@ -360,25 +368,102 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             sljit_sw dstOff;
             getGP(ra, n->id, &dstReg, &dstMem, &dstOff);
 
-            if (srcMem) {
-                sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR0, 0,
-                                srcReg, srcOff);
-                sljit_emit_fop1(C, SLJIT_MOV_F64,
-                                SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff,
-                                SLJIT_FR0, 0);
-            } else {
-                sljit_emit_fop1(C, SLJIT_MOV_F64,
-                                SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff,
-                                srcReg, 0);
-            }
-
-            if (dstMem) {
-                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
-                               SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff);
+            // Fast path: both operands in registers — use sljit_emit_fcopy.
+            if (!srcMem && !dstMem) {
+                sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, srcReg, dstReg);
+            } else if (!srcMem && dstMem) {
+                sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, srcReg, SLJIT_R0);
                 sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff, SLJIT_R0, 0);
             } else {
-                sljit_emit_op1(C, SLJIT_MOV, dstReg, 0,
-                               SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff);
+                // Slow path: source is spilled — use temp area.
+                if (srcMem) {
+                    sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR0, 0,
+                                    srcReg, srcOff);
+                    sljit_emit_fop1(C, SLJIT_MOV_F64,
+                                    SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff,
+                                    SLJIT_FR0, 0);
+                } else {
+                    sljit_emit_fop1(C, SLJIT_MOV_F64,
+                                    SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff,
+                                    srcReg, 0);
+                }
+                if (dstMem) {
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                   SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff);
+                    sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff, SLJIT_R0, 0);
+                } else {
+                    sljit_emit_op1(C, SLJIT_MOV, dstReg, 0,
+                                   SLJIT_MEM1(SLJIT_SP), (sljit_sw)tmpOff);
+                }
+            }
+            break;
+        }
+
+        case IR_UNBOX_INT: {
+            // NaN-tagged Value (GP) -> raw int64 (GP).
+            // The Value holds a double; convert it to integer:
+            //   FMOV freg, gpreg  (reinterpret bits)
+            //   FCVTZS dstreg, freg  (truncate-toward-zero)
+            uint16_t valId = n->op1;
+            if (valId == IR_NONE) break;
+
+            int srcReg, srcMem; sljit_sw srcOff;
+            int dstReg, dstMem; sljit_sw dstOff;
+            getGP(ra, valId, &srcReg, &srcMem, &srcOff);
+            getGP(ra, n->id,  &dstReg, &dstMem, &dstOff);
+
+            // Load source into a GP scratch if spilled.
+            int gpSrc = srcReg;
+            if (srcMem) {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, srcOff);
+                gpSrc = SLJIT_R0;
+            }
+
+            // FMOV freg ← gpreg (bit-reinterpret GP as FP).
+            sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, gpSrc);
+
+            // FCVTZS → truncate double to signed integer.
+            if (dstMem) {
+                sljit_emit_fop1(C, SLJIT_CONV_SW_FROM_F64,
+                                SLJIT_R0, 0, SLJIT_FR0, 0);
+                sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff, SLJIT_R0, 0);
+            } else {
+                sljit_emit_fop1(C, SLJIT_CONV_SW_FROM_F64,
+                                dstReg, 0, SLJIT_FR0, 0);
+            }
+            break;
+        }
+
+        case IR_BOX_INT: {
+            // raw int64 (GP) -> NaN-tagged Value (GP).
+            // Convert integer to double, then bit-reinterpret as GP:
+            //   SCVTF freg, gpreg
+            //   FMOV  dstreg, freg
+            uint16_t valId = n->op1;
+            if (valId == IR_NONE) break;
+
+            int srcReg, srcMem; sljit_sw srcOff;
+            int dstReg, dstMem; sljit_sw dstOff;
+            getGP(ra, valId, &srcReg, &srcMem, &srcOff);
+            getGP(ra, n->id,  &dstReg, &dstMem, &dstOff);
+
+            // Load source into a GP scratch if spilled.
+            int gpSrc = srcReg;
+            if (srcMem) {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, srcOff);
+                gpSrc = SLJIT_R0;
+            }
+
+            // SCVTF freg ← gpreg (integer → double).
+            sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW,
+                            SLJIT_FR0, 0, gpSrc, 0);
+
+            // FMOV gpreg ← freg (bit-reinterpret FP as GP).
+            if (dstMem) {
+                sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, SLJIT_FR0, SLJIT_R0);
+                sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff, SLJIT_R0, 0);
+            } else {
+                sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, SLJIT_FR0, dstReg);
             }
             break;
         }
@@ -483,11 +568,44 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             break;
         }
 
-        // ----- Arithmetic (FP) -----
+        // ----- Arithmetic (FP or integer) -----
         case IR_ADD:
         case IR_SUB:
         case IR_MUL:
         case IR_DIV: {
+            // Integer path: when the node type is IR_TYPE_INT use GP integer ops.
+            if (n->type == IR_TYPE_INT &&
+                (n->op == IR_ADD || n->op == IR_SUB || n->op == IR_MUL)) {
+                sljit_s32 iop;
+                switch (n->op) {
+                    case IR_ADD: iop = SLJIT_ADD; break;
+                    case IR_SUB: iop = SLJIT_SUB; break;
+                    case IR_MUL: iop = SLJIT_MUL; break;
+                    default:     iop = SLJIT_ADD; break;
+                }
+
+                int s1r, s1m; sljit_sw s1o;
+                int s2r, s2m; sljit_sw s2o;
+                int dr, dm; sljit_sw dof;
+                getGP(ra, n->op1, &s1r, &s1m, &s1o);
+                getGP(ra, n->op2, &s2r, &s2m, &s2o);
+                getGP(ra, n->id,  &dr,  &dm,  &dof);
+
+                // Load spilled operands into scratch GP regs.
+                int a = s1r, b = s2r;
+                if (s1m) { sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, s1r, s1o); a = SLJIT_R0; }
+                if (s2m) { sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, s2r, s2o); b = SLJIT_R1; }
+
+                if (dm) {
+                    sljit_emit_op2(C, iop, SLJIT_R0, 0, a, 0, b, 0);
+                    sljit_emit_op1(C, SLJIT_MOV, dr, dof, SLJIT_R0, 0);
+                } else {
+                    sljit_emit_op2(C, iop, dr, 0, a, 0, b, 0);
+                }
+                break;
+            }
+
+            // FP path (default).
             sljit_s32 fop;
             switch (n->op) {
                 case IR_ADD: fop = SLJIT_ADD_F64; break;
@@ -554,13 +672,49 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             break;
         }
 
-        // ----- Comparison (FP -> bool in GP) -----
+        // ----- Comparison (FP or integer -> bool in GP) -----
         case IR_LT:
         case IR_GT:
         case IR_LTE:
         case IR_GTE:
         case IR_EQ:
         case IR_NEQ: {
+            // Integer path: when type is IR_TYPE_INT, emit integer compare.
+            if (n->type == IR_TYPE_INT) {
+                int s1r, s1m; sljit_sw s1o;
+                int s2r, s2m; sljit_sw s2o;
+                int dr, dm;   sljit_sw dof;
+                getGP(ra, n->op1, &s1r, &s1m, &s1o);
+                getGP(ra, n->op2, &s2r, &s2m, &s2o);
+                getGP(ra, n->id,  &dr,  &dm,  &dof);
+
+                int a = s1r, b = s2r;
+                if (s1m) { sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, s1r, s1o); a = SLJIT_R0; }
+                if (s2m) { sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, s2r, s2o); b = SLJIT_R1; }
+
+                // Determine the integer condition flag.
+                sljit_s32 cmpFlag, resultFlag;
+                switch (n->op) {
+                    case IR_LT:  cmpFlag = SLJIT_SET(SLJIT_SIG_LESS);          resultFlag = SLJIT_SIG_LESS; break;
+                    case IR_GT:  cmpFlag = SLJIT_SET(SLJIT_SIG_GREATER);       resultFlag = SLJIT_SIG_GREATER; break;
+                    case IR_LTE: cmpFlag = SLJIT_SET(SLJIT_SIG_LESS_EQUAL);    resultFlag = SLJIT_SIG_LESS_EQUAL; break;
+                    case IR_GTE: cmpFlag = SLJIT_SET(SLJIT_SIG_GREATER_EQUAL); resultFlag = SLJIT_SIG_GREATER_EQUAL; break;
+                    case IR_EQ:  cmpFlag = SLJIT_SET(SLJIT_EQUAL);             resultFlag = SLJIT_EQUAL; break;
+                    case IR_NEQ: cmpFlag = SLJIT_SET(SLJIT_NOT_EQUAL);         resultFlag = SLJIT_NOT_EQUAL; break;
+                    default:     cmpFlag = SLJIT_SET(SLJIT_SIG_LESS);          resultFlag = SLJIT_SIG_LESS; break;
+                }
+
+                sljit_emit_op2u(C, SLJIT_SUB | cmpFlag, a, 0, b, 0);
+
+                if (dm) {
+                    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, resultFlag);
+                    sljit_emit_op1(C, SLJIT_MOV, dr, dof, SLJIT_R0, 0);
+                } else {
+                    sljit_emit_op_flags(C, SLJIT_MOV, dr, 0, resultFlag);
+                }
+                break;
+            }
+
             int src1Reg, src1Mem; sljit_sw src1Off;
             int src2Reg, src2Mem; sljit_sw src2Off;
             getFP(ra, n->op1, &src1Reg, &src1Mem, &src1Off);
@@ -652,12 +806,16 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             int srcReg, srcMem; sljit_sw srcOff;
             getGP(ra, valId, &srcReg, &srcMem, &srcOff);
 
-            // R1 = obj pointer (already unboxed, or unbox here).
+            // R1 = raw NaN-tagged Value (SIGN_BIT | QNAN | obj_ptr).
             if (srcMem) {
                 sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, srcReg, srcOff);
             } else {
                 sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, srcReg, 0);
             }
+
+            // Unmask to get obj pointer: ptr = val & ~(SIGN_BIT | QNAN)
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0, SLJIT_R1, 0,
+                           SLJIT_IMM, (sljit_sw)~(WREN_SIGN_BIT | WREN_QNAN));
 
             // R0 = obj->classObj
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
@@ -1016,15 +1174,62 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
     // ---------------------------------------------------------------------------
     // Side-exit stubs.
     // For each snapshot, emit a stub that:
-    //   1. Loads the exit index into SLJIT_R0
-    //   2. Returns (the caller uses the return value to find the snapshot)
-    // The actual snapshot writeback is done by the interpreter after the trace
-    // returns, using the snapshot data stored in the JitTrace struct.
+    //   1. Writes all snapshot-captured SSA values back to the interpreter stack
+    //      so the interpreter can resume at resume_pc with a valid stack.
+    //   2. Returns exitIdx + 1 so the caller can call wrenJitRestoreExit.
     // ---------------------------------------------------------------------------
     struct sljit_label* exitLabels[IR_MAX_SNAPSHOTS];
 
     for (int si = 0; si < maxSnapshots; si++) {
         exitLabels[si] = sljit_emit_label(C);
+
+        // Write back all snapshot-captured SSA values to the interpreter stack
+        // so the interpreter can resume at resume_pc with a valid stack.
+        if (si < (int)ir->snapshot_count) {
+            const IRSnapshot* snap = &ir->snapshots[si];
+            for (int e = 0; e < (int)snap->num_entries; e++) {
+                int entry_idx = (int)snap->entry_start + e;
+                if (entry_idx >= (int)ir->snapshot_entry_count) break;
+                uint16_t slot = ir->snapshot_entries[entry_idx].slot;
+                uint16_t ref  = ir->snapshot_entries[entry_idx].ssa_ref;
+                if (ref >= (uint16_t)ra->ssa_count) continue;
+
+                int is_fp, spillOff;
+                int r = ssaToSljitReg(ra, ref, &is_fp, &spillOff);
+                sljit_sw dstOff = (sljit_sw)(slot) * 8;
+
+                if (is_fp) {
+                    // FP value (raw double) - shouldn't be in snapshots
+                    // (slot_map always holds boxed Values), but handle defensively.
+                    if (r >= 0) {
+                        sljit_emit_fop1(C, SLJIT_MOV_F64,
+                                        SLJIT_MEM1(REG_STACK_BASE), dstOff,
+                                        r, 0);
+                    } else {
+                        sljit_emit_fop1(C, SLJIT_MOV_F64,
+                                        SLJIT_FR0, 0,
+                                        SLJIT_MEM1(SLJIT_SP), (sljit_sw)spillOff);
+                        sljit_emit_fop1(C, SLJIT_MOV_F64,
+                                        SLJIT_MEM1(REG_STACK_BASE), dstOff,
+                                        SLJIT_FR0, 0);
+                    }
+                } else {
+                    // GP register (NaN-tagged Value) - write to interpreter stack.
+                    if (r >= 0) {
+                        sljit_emit_op1(C, SLJIT_MOV,
+                                       SLJIT_MEM1(REG_STACK_BASE), dstOff,
+                                       r, 0);
+                    } else {
+                        // Spill slot: load via R0 (reserved scratch, safe to clobber).
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                                       SLJIT_MEM1(SLJIT_SP), (sljit_sw)spillOff);
+                        sljit_emit_op1(C, SLJIT_MOV,
+                                       SLJIT_MEM1(REG_STACK_BASE), dstOff,
+                                       SLJIT_R0, 0);
+                    }
+                }
+            }
+        }
 
         // Return exitIdx + 1 (0 means success/no exit).
         sljit_emit_return(C, SLJIT_MOV, SLJIT_IMM, (sljit_sw)(si + 1));

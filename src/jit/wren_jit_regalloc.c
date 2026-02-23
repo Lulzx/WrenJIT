@@ -201,11 +201,18 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
 
     for (uint16_t i = 0; i < buf->count; i++) {
         const IRNode* n = &buf->nodes[i];
+        uint16_t sid = IR_NONE;
         if (n->op == IR_SIDE_EXIT) {
-            uint16_t sid = n->imm.snapshot_id;
-            if (sid < buf->snapshot_count && i > last_exit_for_snap[sid])
-                last_exit_for_snap[sid] = i;
+            sid = n->imm.snapshot_id;
+        } else if (n->op == IR_GUARD_CLASS) {
+            // GUARD_CLASS stores snapshot in op2 (not imm.snapshot_id)
+            sid = n->op2;
+        } else if (n->op == IR_GUARD_NUM || n->op == IR_GUARD_TRUE ||
+                   n->op == IR_GUARD_FALSE || n->op == IR_GUARD_NOT_NULL) {
+            sid = n->imm.snapshot_id;
         }
+        if (sid != IR_NONE && sid < buf->snapshot_count && i > last_exit_for_snap[sid])
+            last_exit_for_snap[sid] = i;
     }
 
     for (uint16_t si = 0; si < buf->snapshot_count; si++) {
