@@ -18,7 +18,6 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
-#include <stdlib.h>
 
 // ---------------------------------------------------------------------------
 // Internal helpers (mirror static helpers from wren_jit_trace.c)
@@ -213,14 +212,7 @@ bool jitTryWidenCall0(WrenJitState* jit, WrenVM* vm, Value* stackStart,
 
     int recv_slot = r->stack_top - 1;
     Value recv_val = stackStart[recv_slot];
-    if (!IS_INSTANCE(recv_val)) {
-        if (getenv("WREN_JIT_DUMP_CALL0")) {
-            ObjClass* rc = wrenGetClassInline(vm, recv_val);
-            fprintf(stderr, "CALL0 unsupported receiver symbol=%u class=%s\n",
-                    symbol, rc && rc->name ? rc->name->value : "?");
-        }
-        return false;
-    }
+    if (!IS_INSTANCE(recv_val)) return false;
 
     ObjInstance* instance = AS_INSTANCE(recv_val);
     ObjClass* classObj = instance->obj.classObj;

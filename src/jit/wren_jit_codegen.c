@@ -4,10 +4,12 @@
 #include "sljitLir.h"
 #include "wren_jit_memory.h"
 #include "wren_jit_regs.h"
+#include "wren_value.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 
 // ---------------------------------------------------------------------------
 // NaN-boxing constants (must match Wren's value representation)
@@ -24,11 +26,10 @@
 #define WREN_TRUE_VAL  (WREN_QNAN | 0x02)
 #define WREN_NULL_VAL  (WREN_QNAN | 0x03)
 
-// Offset of classObj pointer inside Obj struct.
-// Obj layout: ObjType type (enum=int, 4 bytes), bool isDark (1 byte),
-// padding to pointer alignment, then ObjClass* classObj, then Obj* next.
-// On 64-bit: offset is 8.
-#define OBJ_CLASS_OFFSET 8
+// Derive VM object offsets from the actual Wren layout rather than assuming
+// one compiler/ABI's padding.
+#define OBJ_CLASS_OFFSET ((sljit_sw)offsetof(Obj, classObj))
+#define OBJ_FIELDS_OFFSET ((sljit_sw)offsetof(ObjInstance, fields))
 
 // ---------------------------------------------------------------------------
 // Register mapping: convert RegAlloc pool indices to SLJIT registers.
@@ -1249,7 +1250,7 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             // dereferencing (the interpreter recorder uses the same contract).
             sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0, SLJIT_R1, 0,
                            SLJIT_IMM, (sljit_sw)~(WREN_SIGN_BIT | WREN_QNAN));
-            sljit_sw fieldOff = 24 + (sljit_sw)(fieldIdx * 8);
+            sljit_sw fieldOff = OBJ_FIELDS_OFFSET + (sljit_sw)(fieldIdx * 8);
 
             int dstReg, dstMem; sljit_sw dstOff;
             getGP(ra, n->id, &dstReg, &dstMem, &dstOff);
@@ -1283,7 +1284,7 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
 
             sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0, SLJIT_R1, 0,
                            SLJIT_IMM, (sljit_sw)~(WREN_SIGN_BIT | WREN_QNAN));
-            sljit_sw fieldOff = 24 + (sljit_sw)(fieldIdx * 8);
+            sljit_sw fieldOff = OBJ_FIELDS_OFFSET + (sljit_sw)(fieldIdx * 8);
 
             int srcReg, srcMem; sljit_sw srcOff;
             getGP(ra, valId, &srcReg, &srcMem, &srcOff);

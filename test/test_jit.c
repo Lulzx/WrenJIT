@@ -289,6 +289,29 @@ TEST(test_call0_boolean_toggler_inline) {
 }
 
 
+TEST(test_call0_toggler_returning_this_inline) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "class Toggle {\n"
+        "  construct new(v) { _v = v }\n"
+        "  value { _v }\n"
+        "  activate { _v = !_v return this }\n"
+        "}\n"
+        "var t = Toggle.new(true)\n"
+        "var count = 0\n"
+        "var i = 0\n"
+        "while (i < 10000) {\n"
+        "  if (t.activate.value) count = count + 1\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(count)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "5000") != NULL);
+    assert(vm->jit->traces_compiled == 1);
+    wrenFreeVM(vm);
+}
+
 TEST(test_fractional_loop_values_stay_double) {
     resetOutput();
     WrenVM* vm = createVM();
@@ -363,6 +386,7 @@ int main(void) {
     RUN(test_hot_counter_saturates_and_blacklists);
     RUN(test_unsupported_loop_is_blacklisted_once);
     RUN(test_call0_boolean_toggler_inline);
+    RUN(test_call0_toggler_returning_this_inline);
     RUN(test_fractional_loop_values_stay_double);
     RUN(test_range_loop_stack_promotion);
     RUN(test_integer_comparison_specialization);
