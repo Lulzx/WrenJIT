@@ -31,18 +31,25 @@ typedef struct {
 #define MAX_LIVE_RANGES IR_MAX_NODES
 #define MAX_SPILL_SLOTS 256
 
+// Upper bounds on the register pools, used to size the tracking arrays below.
+// How many of each are actually usable depends on the target and is worked out
+// in wren_jit_regs.h.
+#define GP_SCRATCH_POOL_MAX 6
+#define FP_SAVED_POOL_MAX   4
+#define FP_POOL_TOTAL       10
+
 // Register allocator state
 typedef struct {
     LiveRange ranges[MAX_LIVE_RANGES];
     int num_ranges;
 
     // Track which physical registers are free.
-    // GP scratch: indices 0-5 (maps to SLJIT_R0..SLJIT_R5 in codegen)
-    bool gp_scratch_free[6];
-    // FP scratch: indices 0-5 (maps to SLJIT_FR0..SLJIT_FR5 in codegen)
-    bool fp_scratch_free[6];
-    // FP saved: indices 0-3 (maps to SLJIT_FS0..SLJIT_FS3 in codegen)
-    bool fp_saved_free[4];
+    // GP scratch: maps to SLJIT_R0.. in codegen
+    bool gp_scratch_free[GP_SCRATCH_POOL_MAX];
+    // FP scratch: maps to SLJIT_FR0.. in codegen
+    bool fp_scratch_free[FP_POOL_TOTAL];
+    // FP saved: maps to SLJIT_FS0.. in codegen
+    bool fp_saved_free[FP_SAVED_POOL_MAX];
 
     int next_spill_slot;
     int max_spill_slots;    // max spill slot used (for frame size)

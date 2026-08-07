@@ -1,4 +1,5 @@
 #include "wren_jit_regalloc.h"
+#include "wren_jit_regs.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -7,15 +8,11 @@
 // Constants
 // ---------------------------------------------------------------------------
 
-#define GP_SCRATCH_COUNT  6
-#define FP_SCRATCH_COUNT  6
-#define FP_SAVED_COUNT    4
-
 // Encode register pool origin in the reg index stored in RegAlloc so that
 // freeReg can return it to the correct pool.
-// GP scratch:  0 ..  5
-// FP scratch:  100 .. 105
-// FP saved:    200 .. 203
+// GP scratch:  0 ..
+// FP scratch:  100 ..
+// FP saved:    200 ..
 #define FP_SCRATCH_BASE 100
 #define FP_SAVED_BASE   200
 

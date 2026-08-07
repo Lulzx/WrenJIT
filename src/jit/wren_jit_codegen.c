@@ -3,6 +3,7 @@
 // SLJIT header (the .c file is compiled separately via CMakeLists.txt).
 #include "sljitLir.h"
 #include "wren_jit_memory.h"
+#include "wren_jit_regs.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -127,11 +128,11 @@ static void getFP(const RegAllocState* ra, uint16_t ssaId,
 // Number of saved GP registers we use (S0-S3).
 #define NUM_SAVEDS     4
 // Number of scratch GP registers available to the allocator.
-#define NUM_SCRATCHES  6
+#define NUM_SCRATCHES  GP_SCRATCH_COUNT
 // Number of FP scratch registers.
-#define NUM_FP_SCRATCH 6
+#define NUM_FP_SCRATCH FP_SCRATCH_COUNT
 // Number of FP saved registers.
-#define NUM_FP_SAVED   4
+#define NUM_FP_SAVED   FP_SAVED_COUNT
 
 // Temporary spill area offset (past all regalloc spill slots).
 // We reserve 16 bytes for box/unbox temporaries.
@@ -737,26 +738,33 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                 if (s1m) { sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, s1r, s1o); a = SLJIT_R0; }
                 if (s2m) { sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, s2r, s2o); b = SLJIT_R1; }
 
-                // Determine the integer condition flag.
-                sljit_s32 cmpFlag, resultFlag;
+                // Materialize the signed comparison with explicit control
+                // flow. SLJIT's SET flag encoding only accepts the underlying
+                // even condition for complementary predicates, which made the
+                // previous SET(SIG_LESS_EQUAL/EQUAL) construction assert in
+                // argument-checking builds.
+                sljit_s32 condition;
                 switch (n->op) {
-                    case IR_LT:  cmpFlag = SLJIT_SET(SLJIT_SIG_LESS);          resultFlag = SLJIT_SIG_LESS; break;
-                    case IR_GT:  cmpFlag = SLJIT_SET(SLJIT_SIG_GREATER);       resultFlag = SLJIT_SIG_GREATER; break;
-                    case IR_LTE: cmpFlag = SLJIT_SET(SLJIT_SIG_LESS_EQUAL);    resultFlag = SLJIT_SIG_LESS_EQUAL; break;
-                    case IR_GTE: cmpFlag = SLJIT_SET(SLJIT_SIG_GREATER_EQUAL); resultFlag = SLJIT_SIG_GREATER_EQUAL; break;
-                    case IR_EQ:  cmpFlag = SLJIT_SET(SLJIT_EQUAL);             resultFlag = SLJIT_EQUAL; break;
-                    case IR_NEQ: cmpFlag = SLJIT_SET(SLJIT_NOT_EQUAL);         resultFlag = SLJIT_NOT_EQUAL; break;
-                    default:     cmpFlag = SLJIT_SET(SLJIT_SIG_LESS);          resultFlag = SLJIT_SIG_LESS; break;
+                    case IR_LT:  condition = SLJIT_SIG_LESS; break;
+                    case IR_GT:  condition = SLJIT_SIG_GREATER; break;
+                    case IR_LTE: condition = SLJIT_SIG_LESS_EQUAL; break;
+                    case IR_GTE: condition = SLJIT_SIG_GREATER_EQUAL; break;
+                    case IR_EQ:  condition = SLJIT_EQUAL; break;
+                    case IR_NEQ: condition = SLJIT_NOT_EQUAL; break;
+                    default:     condition = SLJIT_SIG_LESS; break;
                 }
 
-                sljit_emit_op2u(C, SLJIT_SUB | cmpFlag, a, 0, b, 0);
-
-                if (dm) {
-                    sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, resultFlag);
-                    sljit_emit_op1(C, SLJIT_MOV, dr, dof, SLJIT_R0, 0);
-                } else {
-                    sljit_emit_op_flags(C, SLJIT_MOV, dr, 0, resultFlag);
-                }
+                struct sljit_jump* isTrue =
+                    sljit_emit_cmp(C, condition, a, 0, b, 0);
+                int out = dm ? SLJIT_R0 : dr;
+                sljit_emit_op1(C, SLJIT_MOV, out, 0, SLJIT_IMM, 0);
+                struct sljit_jump* done = sljit_emit_jump(C, SLJIT_JUMP);
+                struct sljit_label* trueLabel = sljit_emit_label(C);
+                sljit_set_label(isTrue, trueLabel);
+                sljit_emit_op1(C, SLJIT_MOV, out, 0, SLJIT_IMM, 1);
+                struct sljit_label* doneLabel = sljit_emit_label(C);
+                sljit_set_label(done, doneLabel);
+                if (dm) sljit_emit_op1(C, SLJIT_MOV, dr, dof, out, 0);
                 break;
             }
 

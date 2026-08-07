@@ -276,7 +276,10 @@ TEST(test_call0_boolean_toggler_inline) {
         "}\n"
         "var b = Box.new(false)\n"
         "var i = 0\n"
-        "while (i < 10000) { b.toggle i = i + 1 }\n"
+        "while (i < 10000) {\n"
+        "  b.toggle\n"
+        "  i = i + 1\n"
+        "}\n"
         "System.print(b.value)\n";
     WrenInterpretResult result = wrenInterpret(vm, "main", src);
     assert(result == WREN_RESULT_SUCCESS);
@@ -302,6 +305,24 @@ TEST(test_fractional_loop_values_stay_double) {
     wrenFreeVM(vm);
 }
 
+TEST(test_integer_comparison_specialization) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var i = 0\n"
+        "var count = 0\n"
+        "while (i <= 1000) {\n"
+        "  if (i == 500) count = count + 1\n"
+        "  if (i != 500) count = count + 1\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(count)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "1001") != NULL);
+    assert(vm->jit->traces_compiled == 1);
+    wrenFreeVM(vm);
+}
+
 TEST(test_huge_loop_value_stays_double) {
     resetOutput();
     WrenVM* vm = createVM();
@@ -324,6 +345,7 @@ int main(void) {
     RUN(test_unsupported_loop_is_blacklisted_once);
     RUN(test_call0_boolean_toggler_inline);
     RUN(test_fractional_loop_values_stay_double);
+    RUN(test_integer_comparison_specialization);
     RUN(test_huge_loop_value_stays_double);
     RUN(test_simple_sum);
     RUN(test_for_loop);
