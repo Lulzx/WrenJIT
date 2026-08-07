@@ -68,7 +68,6 @@ static IROp numMethodToIROp(WrenVM* vm, int symbol)
     if (methodNameEquals(vm, symbol, "-(_)"))  return IR_SUB;
     if (methodNameEquals(vm, symbol, "*(_)"))  return IR_MUL;
     if (methodNameEquals(vm, symbol, "/(_)"))  return IR_DIV;
-    if (methodNameEquals(vm, symbol, "%(_)"))  return IR_MOD;
     if (methodNameEquals(vm, symbol, "<(_)"))  return IR_LT;
     if (methodNameEquals(vm, symbol, ">(_)"))  return IR_GT;
     if (methodNameEquals(vm, symbol, "<=(_)")) return IR_LTE;

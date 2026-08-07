@@ -184,6 +184,44 @@ TEST(test_multiple_vms) {
     }
 }
 
+
+TEST(test_modulo_falls_back_safely) {
+    // IR_MOD has no native code generator yet. The recorder must reject it
+    // instead of compiling a trace whose result register is undefined.
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var sum = 0\n"
+        "var i = 0\n"
+        "while (i < 1000) {\n"
+        "  sum = sum + (i % 7)\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(sum)\n";
+    WrenInterpretResult result = wrenInterpret(vm, "main", src);
+    assert(result == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "2997") != NULL);
+    wrenFreeVM(vm);
+}
+
+TEST(test_nan_not_equal) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var nan = 0 / 0\n"
+        "var count = 0\n"
+        "var i = 0\n"
+        "while (i < 100) {\n"
+        "  if (nan != nan) count = count + 1\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(count)\n";
+    WrenInterpretResult result = wrenInterpret(vm, "main", src);
+    assert(result == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "100") != NULL);
+    wrenFreeVM(vm);
+}
+
 int main(void) {
     printf("=== JIT Integration Tests ===\n");
     RUN(test_simple_sum);
@@ -193,6 +231,8 @@ int main(void) {
     RUN(test_multiplication_loop);
     RUN(test_nested_while);
     RUN(test_hot_loop);
+    RUN(test_modulo_falls_back_safely);
+    RUN(test_nan_not_equal);
     RUN(test_multiple_vms);
     printf("All JIT tests passed!\n");
     return 0;

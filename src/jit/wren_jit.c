@@ -87,7 +87,7 @@ void wrenJitSetEnabled(WrenJitState* jit, bool enabled)
 
 JitTrace* wrenJitLookup(WrenJitState* jit, uint8_t* pc)
 {
-    if (jit == NULL || jit->traces == NULL) return NULL;
+    if (jit == NULL || jit->traces == NULL || jit->trace_count == 0) return NULL;
 
     uint32_t mask = jit->trace_capacity - 1;
     uint32_t idx = hash_pc(pc) & mask;

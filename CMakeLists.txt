@@ -71,7 +71,11 @@ endif()
 
 # Compiler flags
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    target_compile_options(wrenjit_vm PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
+    target_compile_options(wrenjit_vm PRIVATE
+        -Wall -Wextra -Wno-unused-parameter
+        $<$<CONFIG:Release>:-O3>
+        $<$<NOT:$<CONFIG:Release>>:-O2>
+    )
 endif()
 
 # Platform libs for JIT executable memory

@@ -402,10 +402,10 @@ static void spillAtInterval(RegAllocState* state, ActiveSet* active,
         spill->alloc = makeSpill(state, spill->reg_class);
         state->ssa_to_reg[spill->ssa_id] = spill->alloc;
 
+        // The caller inserts the current range after spillAtInterval returns.
+        // Do not insert a dummy entry here: activeInsert dereferences its range
+        // array while ordering and can crash whenever the active set is nonempty.
         activeRemove(active, spill_pos);
-        activeInsert(active, -1, NULL); // We'll insert current below.
-        // Actually, we need to insert current properly. Remove the bad insert.
-        active->count--; // undo the dummy insert above
     } else {
         // Current has a further or equal end; spill current.
         current->alloc = makeSpill(state, current->reg_class);

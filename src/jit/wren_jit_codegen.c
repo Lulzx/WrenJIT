@@ -740,7 +740,9 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                 case IR_LTE: cmpFlag = SLJIT_SET_F_LESS_EQUAL;   resultFlag = SLJIT_F_LESS_EQUAL; break;
                 case IR_GTE: cmpFlag = SLJIT_SET_F_LESS_EQUAL;   resultFlag = SLJIT_F_LESS_EQUAL; break;
                 case IR_EQ:  cmpFlag = SLJIT_SET_ORDERED_EQUAL;  resultFlag = SLJIT_ORDERED_EQUAL; break;
-                case IR_NEQ: cmpFlag = SLJIT_SET_ORDERED_NOT_EQUAL; resultFlag = SLJIT_ORDERED_NOT_EQUAL; break;
+                // Wren Num != follows C/IEEE semantics: unordered (NaN)
+                // comparisons are also not equal.
+                case IR_NEQ: cmpFlag = SLJIT_SET_UNORDERED_OR_NOT_EQUAL; resultFlag = SLJIT_UNORDERED_OR_NOT_EQUAL; break;
                 default:     cmpFlag = SLJIT_SET_F_LESS;         resultFlag = SLJIT_F_LESS; break;
             }
 
