@@ -155,7 +155,9 @@ void jitRecorderAbort(WrenJitState* jit, const char* reason)
 {
     if (jit == NULL || jit->recorder == NULL) return;
 
-    fprintf(stderr, "[JIT] abort: %s\n", reason ? reason : "unknown");
+    if (wrenJitDebugEnabled()) {
+        fprintf(stderr, "[JIT] abort: %s\n", reason ? reason : "unknown");
+    }
 
     JitRecorder* r = (JitRecorder*)jit->recorder;
     r->aborted = true;

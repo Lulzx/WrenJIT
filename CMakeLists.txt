@@ -120,11 +120,42 @@ endif()
 # ---------- Tests ----------
 enable_testing()
 
-# Run upstream Wren test suite (if test runner exists)
-if(EXISTS ${WREN_DIR}/test)
-    add_test(NAME wren_upstream_tests
-        COMMAND ${CMAKE_COMMAND} -E echo "TODO: integrate upstream Wren tests"
+# Upstream Wren test suite.
+#
+# Wren ships its own harness (test/main.c) and driver (util/test.py); the driver
+# reads `// expect:` comments out of each .wren file and diffs them against what
+# the harness printed. Building that harness against wrenjit_vm rather than
+# stock Wren runs all ~900 upstream tests through the JIT, which covers far more
+# of the language than test_jit's hand-written loops do.
+#
+# test.py hardcodes the harness path as <wren>/bin/wren_test, so the binary has
+# to land there. vendor/wren/.gitignore already ignores /bin, so this leaves the
+# submodule clean.
+find_package(Python3 COMPONENTS Interpreter)
+
+if(EXISTS ${WREN_DIR}/test/main.c AND Python3_Interpreter_FOUND)
+    file(GLOB WREN_TEST_API_SOURCES ${WREN_DIR}/test/api/*.c)
+    add_executable(wren_test
+        ${WREN_DIR}/test/main.c
+        ${WREN_DIR}/test/test.c
+        ${WREN_TEST_API_SOURCES}
     )
+    target_link_libraries(wren_test PRIVATE wrenjit_vm)
+    target_include_directories(wren_test PRIVATE ${WREN_DIR}/test)
+    set_target_properties(wren_test PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${WREN_DIR}/bin
+        OUTPUT_NAME wren_test
+    )
+
+    add_test(NAME wren_upstream_tests
+        COMMAND ${Python3_EXECUTABLE} ${WREN_DIR}/util/test.py
+    )
+    # test.py resolves test paths relative to the Wren checkout.
+    set_tests_properties(wren_upstream_tests PROPERTIES
+        WORKING_DIRECTORY ${WREN_DIR}
+    )
+elseif(NOT Python3_Interpreter_FOUND)
+    message(STATUS "Python3 not found -- skipping upstream Wren test suite")
 endif()
 
 # JIT test targets

@@ -110,6 +110,12 @@ void wrenJitFree(WrenVM* vm, WrenJitState* jit);
 // Enable or disable the JIT.
 void wrenJitSetEnabled(WrenJitState* jit, bool enabled);
 
+// True when WREN_JIT_DEBUG is set to something other than "0". All JIT
+// diagnostics are gated on this: a trace that fails to record or compile is
+// ordinary operation, and writing that to stderr would corrupt the output of an
+// embedder that captures it. Looked up once and cached.
+bool wrenJitDebugEnabled(void);
+
 // Look up a compiled trace by anchor PC. Returns NULL if not found.
 JitTrace* wrenJitLookup(WrenJitState* jit, uint8_t* pc);
 

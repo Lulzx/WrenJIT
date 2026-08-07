@@ -16,15 +16,26 @@
 #include <string.h>
 #include <stdio.h>
 
-static bool jitDebugEnabled(void)
+// Failing to trace a loop is ordinary operation, not an error: any loop the
+// recorder does not support simply keeps running interpreted. Reporting that on
+// stderr corrupts the output of any embedder that captures it, so every JIT
+// diagnostic is gated behind WREN_JIT_DEBUG. The upstream Wren suite is one
+// such embedder, and treats a stray stderr line as a test failure.
+bool wrenJitDebugEnabled(void)
 {
-    const char* value = getenv("WREN_JIT_DEBUG");
-    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+    // getenv is not cheap enough to call from a recorder abort, which can run
+    // once per unsupported loop. -1 means "not yet looked up".
+    static int cached = -1;
+    if (cached < 0) {
+        const char* value = getenv("WREN_JIT_DEBUG");
+        cached = (value != NULL && value[0] != '\0' && strcmp(value, "0") != 0);
+    }
+    return cached != 0;
 }
 
 #define JIT_DEBUG_LOG(...)                           \
     do {                                            \
-        if (jitDebugEnabled()) {                    \
+        if (wrenJitDebugEnabled()) {                \
             fprintf(stderr, __VA_ARGS__);           \
         }                                           \
     } while (0)
@@ -52,6 +63,21 @@ WrenJitState* wrenJitInit(WrenVM* vm)
     jit->state = JIT_STATE_IDLE;
     jit->enabled = true;
     jit->hot_threshold = JIT_HOT_THRESHOLD;
+
+    // Most programs only trace their handful of genuinely hot loops, which is
+    // the point, but it makes a general test suite a poor net for codegen bugs:
+    // upstream Wren's 900 tests are small enough that only two of them ever
+    // reach the default threshold. Lowering it to 1 forces every loop in a
+    // suite through the recorder and code generator instead.
+    const char* threshold = getenv("WREN_JIT_HOT_THRESHOLD");
+    if (threshold != NULL && threshold[0] != '\0') {
+        long parsed = strtol(threshold, NULL, 10);
+        // The counter is a uint16_t and UINT16_MAX is the blacklist sentinel,
+        // so a threshold at or above it could never be reached.
+        if (parsed >= 1 && parsed < JIT_HOT_BLACKLISTED) {
+            jit->hot_threshold = (int)parsed;
+        }
+    }
 
     return jit;
 }
@@ -289,7 +315,7 @@ JitTrace* wrenJitCompileAndStore(WrenVM* vm, WrenJitState* jit,
     // Get the IR from the recorder (jitRecorderStep built it).
     JitRecorder* rec = jitRecorderGet(jit);
     if (!rec) {
-        fprintf(stderr, "[JIT] compile: no recorder\n");
+        JIT_DEBUG_LOG("[JIT] compile: no recorder\n");
         jit->traces_aborted++;
         wrenJitBlacklistCurrent(jit);
         return NULL;
@@ -299,7 +325,7 @@ JitTrace* wrenJitCompileAndStore(WrenVM* vm, WrenJitState* jit,
     // Require at least one guard/arithmetic node between LOOP_HEADER and
     // LOOP_BACK. A trace without guards would loop forever in native code.
     if (ir->snapshot_count == 0) {
-        fprintf(stderr, "[JIT] compile: no snapshots, aborting\n");
+        JIT_DEBUG_LOG("[JIT] compile: no snapshots, aborting\n");
         jit->traces_aborted++;
         wrenJitBlacklistCurrent(jit);
         return NULL;
@@ -330,7 +356,7 @@ JitTrace* wrenJitCompileAndStore(WrenVM* vm, WrenJitState* jit,
     regAllocFree(&ra);
 
     if (!trace) {
-        fprintf(stderr, "[JIT] compile: codegen failed\n");
+        JIT_DEBUG_LOG("[JIT] compile: codegen failed\n");
         jit->traces_aborted++;
         wrenJitBlacklistCurrent(jit);
         return NULL;
