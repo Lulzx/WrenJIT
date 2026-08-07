@@ -305,6 +305,25 @@ TEST(test_fractional_loop_values_stay_double) {
     wrenFreeVM(vm);
 }
 
+TEST(test_range_loop_stack_promotion) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var fractional = 0\n"
+        "for (i in 0.5..3.5) fractional = fractional + i\n"
+        "var descending = 0\n"
+        "for (i in 3..1) descending = descending + i\n"
+        "var stopped = 0\n"
+        "for (i in 1..100) {\n"
+        "  if (i == 60) break\n"
+        "  stopped = stopped + i\n"
+        "}\n"
+        "System.print(\"%(fractional),%(descending),%(stopped)\")\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "8,6,1770") != NULL);
+    wrenFreeVM(vm);
+}
+
 TEST(test_integer_comparison_specialization) {
     resetOutput();
     WrenVM* vm = createVM();
@@ -345,6 +364,7 @@ int main(void) {
     RUN(test_unsupported_loop_is_blacklisted_once);
     RUN(test_call0_boolean_toggler_inline);
     RUN(test_fractional_loop_values_stay_double);
+    RUN(test_range_loop_stack_promotion);
     RUN(test_integer_comparison_specialization);
     RUN(test_huge_loop_value_stays_double);
     RUN(test_simple_sum);

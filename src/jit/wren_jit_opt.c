@@ -301,7 +301,10 @@ void irOptRedundantGuardElim(IRBuffer* buf)
 
         switch (n->op) {
             case IR_GUARD_NUM:
-                if (bitTest(guardedNum, val)) {
+                if (buf->nodes[val].op == IR_BOX_NUM ||
+                    buf->nodes[val].op == IR_BOX_INT) {
+                    killNode(n); // producer proves Wren Num representation
+                } else if (bitTest(guardedNum, val)) {
                     killNode(n);
                 } else {
                     bitSet(guardedNum, val);
@@ -309,7 +312,13 @@ void irOptRedundantGuardElim(IRBuffer* buf)
                 break;
 
             case IR_GUARD_TRUE:
-                if (bitTest(guardedTrue, val)) {
+                // Every Wren number and object is truthy, including zero and
+                // NaN. A boxing producer therefore proves this guard.
+                if (buf->nodes[val].op == IR_BOX_NUM ||
+                    buf->nodes[val].op == IR_BOX_INT ||
+                    buf->nodes[val].op == IR_BOX_OBJ) {
+                    killNode(n);
+                } else if (bitTest(guardedTrue, val)) {
                     killNode(n);
                 } else {
                     bitSet(guardedTrue, val);
@@ -1391,6 +1400,93 @@ void irOptPromoteLoopVars(IRBuffer* buf)
                 killNode(kn);
             }
         }
+    }
+
+    // Promote numeric interpreter-stack locals in the same way. Stack values
+    // are reconstructed from snapshots on every exit, so the hot loop does
+    // not need to reload/store a local that has one simple back-edge update.
+    bool promoted_slots[256];
+    memset(promoted_slots, 0, sizeof(promoted_slots));
+    for (uint16_t i = header + 1; i < back; i++) {
+        IRNode* load = &buf->nodes[i];
+        if ((load->flags & IR_FLAG_DEAD) || load->op != IR_LOAD_STACK) continue;
+        uint16_t slot = load->imm.mem.slot;
+        if (slot >= 256 || promoted_slots[slot]) continue;
+
+        uint16_t store_id = IR_NONE;
+        int store_count = 0;
+        bool has_call = false;
+        for (uint16_t k = header + 1; k < back; k++) {
+            const IRNode* n = &buf->nodes[k];
+            if (n->flags & IR_FLAG_DEAD) continue;
+            if (n->op == IR_CALL_C || n->op == IR_CALL_WREN) has_call = true;
+            if (n->op == IR_STORE_STACK && n->imm.mem.slot == slot) {
+                store_id = k;
+                store_count++;
+            }
+        }
+        if (has_call || store_count != 1 || store_id <= i) continue;
+
+        uint16_t stored = buf->nodes[store_id].op1;
+        if (stored == IR_NONE || stored >= buf->count ||
+            buf->nodes[stored].op != IR_BOX_NUM) continue;
+
+        bool load_after_store = false;
+        for (uint16_t k = (uint16_t)(store_id + 1); k < back; k++) {
+            const IRNode* n = &buf->nodes[k];
+            if (!(n->flags & IR_FLAG_DEAD) && n->op == IR_LOAD_STACK &&
+                n->imm.mem.slot == slot) {
+                load_after_store = true;
+                break;
+            }
+        }
+        if (load_after_store) continue;
+
+        // Every possible exit must describe the local, otherwise its old
+        // interpreter memory cell could be observed after the store was sunk.
+        bool snapshots_cover_slot = true;
+        for (uint16_t sid = 0; sid < buf->snapshot_count; sid++) {
+            bool found = false;
+            IRSnapshot* snap = &buf->snapshots[sid];
+            for (uint16_t e = 0; e < snap->num_entries; e++) {
+                IRSnapshotEntry* entry =
+                    &buf->snapshot_entries[snap->entry_start + e];
+                if (entry->slot == slot) { found = true; break; }
+            }
+            if (!found) { snapshots_cover_slot = false; break; }
+        }
+        if (!snapshots_cover_slot) continue;
+
+        while (nextNop < header && buf->nodes[nextNop].op != IR_NOP) nextNop++;
+        uint16_t initial = nextNop;
+        uint16_t phi_id = (uint16_t)(nextNop + 1);
+        if (phi_id >= header || buf->nodes[initial].op != IR_NOP ||
+            buf->nodes[phi_id].op != IR_NOP) continue;
+        nextNop += 2;
+
+        buf->nodes[initial] = *load;
+        buf->nodes[initial].id = initial;
+        buf->nodes[initial].flags = 0;
+
+        IRNode* phi = &buf->nodes[phi_id];
+        phi->op = IR_PHI;
+        phi->id = phi_id;
+        phi->op1 = initial;
+        phi->op2 = stored;
+        phi->type = IR_TYPE_VALUE;
+        phi->flags = 0;
+        memset(&phi->imm, 0, sizeof(phi->imm));
+
+        for (uint16_t k = header + 1; k < back; k++) {
+            IRNode* n = &buf->nodes[k];
+            if (!(n->flags & IR_FLAG_DEAD) && n->op == IR_LOAD_STACK &&
+                n->imm.mem.slot == slot) {
+                replaceUses(buf, k, phi_id);
+                killNode(n);
+            }
+        }
+        killNode(&buf->nodes[store_id]);
+        promoted_slots[slot] = true;
     }
 }
 

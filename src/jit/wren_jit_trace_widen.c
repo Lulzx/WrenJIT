@@ -18,6 +18,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 // ---------------------------------------------------------------------------
 // Internal helpers (mirror static helpers from wren_jit_trace.c)
@@ -212,7 +213,14 @@ bool jitTryWidenCall0(WrenJitState* jit, WrenVM* vm, Value* stackStart,
 
     int recv_slot = r->stack_top - 1;
     Value recv_val = stackStart[recv_slot];
-    if (!IS_INSTANCE(recv_val)) return false;
+    if (!IS_INSTANCE(recv_val)) {
+        if (getenv("WREN_JIT_DUMP_CALL0")) {
+            ObjClass* rc = wrenGetClassInline(vm, recv_val);
+            fprintf(stderr, "CALL0 unsupported receiver symbol=%u class=%s\n",
+                    symbol, rc && rc->name ? rc->name->value : "?");
+        }
+        return false;
+    }
 
     ObjInstance* instance = AS_INSTANCE(recv_val);
     ObjClass* classObj = instance->obj.classObj;
@@ -239,7 +247,19 @@ bool jitTryWidenCall0(WrenJitState* jit, WrenVM* vm, Value* stackStart,
                    code[1] == code[6] &&
                    widenMethodNameEquals(vm,
                        (int)(((uint16_t)code[3] << 8) | code[4]), "!");
-    if (!getter && !toggler) return false;
+    // `_field = !_field; return this` has the same side effect followed by
+    // POP, LOAD_LOCAL_0, RETURN and the compiler's NULL/RETURN epilogue.
+    bool toggler_returns_this = count == 13 &&
+                   code[0] == CODE_LOAD_FIELD_THIS &&
+                   code[2] == CODE_CALL_0 &&
+                   code[5] == CODE_STORE_FIELD_THIS &&
+                   code[7] == CODE_POP && code[8] == CODE_LOAD_LOCAL_0 &&
+                   code[9] == CODE_RETURN && code[10] == CODE_NULL &&
+                   code[11] == CODE_RETURN && code[12] == CODE_END &&
+                   code[1] == code[6] &&
+                   widenMethodNameEquals(vm,
+                       (int)(((uint16_t)code[3] << 8) | code[4]), "!");
+    if (!getter && !toggler && !toggler_returns_this) return false;
 
     uint16_t field = code[1];
     if (field >= (uint16_t)classObj->numFields) return false;
@@ -254,7 +274,7 @@ bool jitTryWidenCall0(WrenJitState* jit, WrenVM* vm, Value* stackStart,
     uint16_t obj = recv_ssa;
     uint16_t value = irEmitLoadField(&r->ir, obj, field);
 
-    if (toggler) {
+    if (toggler || toggler_returns_this) {
         // `!` accepts every Wren value, but XOR only models its boolean case.
         // A type guard preserves general semantics by side-exiting for a field
         // that has changed to null, a number, or an object since recording.
@@ -263,7 +283,7 @@ bool jitTryWidenCall0(WrenJitState* jit, WrenVM* vm, Value* stackStart,
         irEmitStoreField(&r->ir, obj, field, value);
     }
 
-    widenSlotSet(r, recv_slot, value);
+    widenSlotSet(r, recv_slot, toggler_returns_this ? recv_ssa : value);
 
     // The real interpreter still enters this METHOD_BLOCK. Its result and
     // side effect agree with the IR above, but recording those callee bytecodes
