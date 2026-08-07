@@ -3,6 +3,7 @@
 #include <string.h>
 #include "wren_jit_ir.h"
 #include "wren_jit_opt.h"
+#include "wren_jit_codegen.h"
 
 #define TEST(name) static void name(void)
 #define RUN(name) do { printf("  %s...", #name); name(); printf(" OK\n"); } while(0)
@@ -308,6 +309,18 @@ TEST(test_dce_chain) {
     assert(buf.nodes[c].flags & IR_FLAG_DEAD);
 }
 
+TEST(test_unsupported_codegen_ops_are_rejected) {
+    const IROp unsupported[] = { IR_MOD, IR_CALL_C, IR_CALL_WREN };
+    for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
+        IRBuffer buf;
+        irBufferInit(&buf);
+        uint16_t a = irEmitConst(&buf, 7.0);
+        uint16_t b = irEmitConst(&buf, 3.0);
+        irEmit(&buf, unsupported[i], a, b, IR_TYPE_NUM);
+        assert(wrenJitCodegen(NULL, &buf, NULL, NULL, NULL) == NULL);
+    }
+}
+
 TEST(test_loop_ir) {
     IRBuffer buf;
     irBufferInit(&buf);
@@ -445,6 +458,7 @@ int main(void) {
     RUN(test_const_fold_mul);
     RUN(test_dce);
     RUN(test_dce_chain);
+    RUN(test_unsupported_codegen_ops_are_rejected);
     RUN(test_loop_ir);
     RUN(test_phi);
     RUN(test_side_exit);

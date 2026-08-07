@@ -157,6 +157,10 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
     for (uint16_t i = 0; i < ir->count; i++) {
         const IRNode* n = &ir->nodes[i];
         if ((n->flags & IR_FLAG_DEAD) || n->op == IR_NOP) continue;
+        // Never produce a trace containing an operation whose switch case is
+        // still a placeholder; silently omitting it is guaranteed wrong-code.
+        if (n->op == IR_MOD || n->op == IR_CALL_C || n->op == IR_CALL_WREN)
+            return NULL;
         uint16_t sid = IR_NONE;
         uint16_t needed = 0;
         if (n->op == IR_GUARD_CLASS) {
