@@ -149,6 +149,37 @@ Enable compiler-path debug logs only when needed:
 WREN_JIT_DEBUG=1 ./build/wrenjit_cli script.wren --jit
 ```
 
+## Benchmarking
+
+`bench/run_benchmarks.py` runs a suite and reports the benchmark's own
+`elapsed:` time, best of N trials, alongside JIT trace counts and abort reasons.
+
+```sh
+python3 bench/run_benchmarks.py --suite recursion --luajit --trials 5
+```
+
+Suites are `page` (the workloads from wren.io/performance.html), `repo`
+(the microbenchmarks), `recursion`, and `all`. Passing `--luajit` also times the
+matching `bench/lua_equivalents/<name>.lua` with LuaJIT's JIT off and on. The
+Lua and Wren versions of each benchmark are written to do the same work in the
+same shape, and their printed results are compared for equality.
+
+`bench/gen_report.py` turns the JSON into the published report:
+
+```sh
+python3 bench/run_benchmarks.py --suite recursion --luajit --json > bench/results.json
+python3 bench/gen_report.py bench/results.json --output docs/index.html
+```
+
+`docs/` is served at [lulzx.github.io/WrenJIT](https://lulzx.github.io/WrenJIT/).
+
+### Recursion
+
+The JIT starts counting at the `LOOP` bytecode, so it only ever records loops.
+Recursive workloads never reach that counter and compile zero traces, running at
+plain interpreter speed. `bench_fib`, `bench_tak`, `bench_ack`, `bench_mutual`,
+and `bench_deep` all measure that gap.
+
 ## Limitations
 
 - Range-based `for` loops compile via monomorphic inlining; other object method

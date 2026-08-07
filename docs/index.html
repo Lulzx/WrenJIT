@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WrenJIT Performance</title>
+<link href="https://fonts.googleapis.com/css?family=Source+Sans+Pro:400,600|Source+Code+Pro:400|Sanchez:400" rel="stylesheet">
+<style>
+:root {
+  --header: "Sanchez", helvetica, arial, sans-serif;
+  --body: "Source Sans Pro", georgia, serif;
+  --code: "Source Code Pro", Menlo, Monaco, Consolas, monospace;
+  --light: hsl(0, 0%, 100%);
+  --text: #333333;
+  --gray-10: #ebebec;
+  --gray-20: #d7d8da;
+  --gray-80: #60666a;
+  --link: hsl(200, 60%, 50%);
+  --link-dark: hsl(210, 60%, 20%);
+  --wren: #1d5176;
+  --luajit: hsl(28, 75%, 52%);
+  --luajit-off: hsl(28, 45%, 72%);
+}
+* { box-sizing: border-box; }
+body {
+  background-color: var(--light);
+  color: var(--text);
+  font: 16px/25px var(--body);
+  margin: 0;
+  padding: 0 24px 80px 24px;
+}
+.page { max-width: 720px; margin: 0 auto; }
+h1 { padding-top: 40px; font: 500 36px/48px var(--header); color: var(--link); margin: 0 0 4px 0; }
+h2 { font-weight: 500; font-size: 24px; font-family: var(--header); margin: 40px 0 0 0; color: var(--link); }
+h3 { font: 20px var(--body); margin: 28px 0 0 0; color: var(--link); }
+p { margin: 12px 0 0 0; }
+code { font: 14px var(--code); background: #f7f7f8; padding: 1px 4px; border-radius: 2px; }
+a { color: var(--link); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.subtitle { color: var(--gray-80); font-size: 17px; margin-top: 0; }
+.note { font-size: 14px; color: var(--gray-80); margin: 6px 0 0 25px; }
+table.chart { margin: 4px 0 0 0; padding: 5px 0 5px 25px; border-collapse: collapse; width: 100%; }
+table.chart td, table.chart th { line-height: 14px; margin: 0; padding: 1px 0; }
+table.chart th { font-size: 14px; width: 118px; text-align: left; font-weight: normal; color: var(--gray-80); }
+table.chart .chart-bar {
+  display: inline-block;
+  font: 13px var(--body);
+  color: var(--light);
+  background: var(--link);
+  border-bottom: solid 1px var(--link-dark);
+  text-align: right;
+  border-radius: 2px;
+  white-space: nowrap;
+  min-width: 54px;
+}
+table.chart .chart-bar.wren { background: var(--wren); }
+table.chart .chart-bar.wren-jit { background: var(--link); }
+table.chart .chart-bar.luajit { background: var(--luajit); border-bottom-color: hsl(28, 75%, 30%); }
+table.chart .chart-bar.luajit-off { background: var(--luajit-off); border-bottom-color: hsl(28, 45%, 45%); color: #4a3520; }
+table.summary { border-collapse: collapse; margin-top: 14px; font-size: 14px; width: 100%; }
+table.summary th, table.summary td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--gray-10); }
+table.summary th:first-child, table.summary td:first-child { text-align: left; }
+table.summary th { color: var(--gray-80); font-weight: 600; }
+.meta { font-size: 14px; color: var(--gray-80); border-top: 1px solid var(--gray-20); margin-top: 48px; padding-top: 12px; }
+.legend { font-size: 14px; color: var(--gray-80); margin-top: 8px; }
+.swatch { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin: 0 4px 0 12px; vertical-align: -1px; }
+.swatch:first-child { margin-left: 0; }
+@media (max-width: 560px) {
+  table.chart th { width: 96px; font-size: 13px; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+<h1>WrenJIT Performance</h1>
+<p class="subtitle">A tracing JIT for Wren, measured against LuaJIT. Shorter bars are better.</p>
+
+<p>Every benchmark below exists twice: once in Wren, once in Lua, written to do
+the same work in the same shape. Both print their own elapsed time, so process
+startup and JIT compilation stay out of the numbers. Each bar is the best of
+several runs.</p>
+
+<p class="legend">
+<span class="swatch" style="background: var(--link)"></span>wren (jit)
+<span class="swatch" style="background: var(--wren)"></span>wren (no jit)
+<span class="swatch" style="background: var(--luajit-off)"></span>luajit (-joff)
+<span class="swatch" style="background: var(--luajit)"></span>luajit
+</p>
+
+<h2>Where things stand</h2>
+
+<p>The JIT records traces from loops. It starts counting at the <code>LOOP</code>
+bytecode, records one iteration, and compiles it. Recursion never reaches that
+counter, so on the recursive benchmarks the JIT compiles nothing at all and Wren
+runs at plain interpreter speed. Those rows are the gap worth closing.</p>
+
+<table class="summary">
+<tr><th>benchmark</th><th>wren ms</th><th>luajit -joff ms</th><th>luajit ms</th><th>vs -joff</th><th>vs luajit</th></tr>
+<tr><td><code>bench_fib</code></td><td>769.5</td><td>187.7</td><td>53.0</td><td>4.1&times;</td><td>14.5&times;</td></tr>
+<tr><td><code>bench_tak</code></td><td>70.3</td><td>15.7</td><td>6.3</td><td>4.5&times;</td><td>11.2&times;</td></tr>
+<tr><td><code>bench_ack</code></td><td>17.4</td><td>5.1</td><td>1.0</td><td>3.4&times;</td><td>17.0&times;</td></tr>
+<tr><td><code>bench_mutual</code></td><td>17.7</td><td>8.9</td><td>0.3</td><td>2.0&times;</td><td>55.6&times;</td></tr>
+<tr><td><code>bench_deep</code></td><td>43.1</td><td>11.0</td><td>6.9</td><td>3.9&times;</td><td>6.3&times;</td></tr>
+<tr><td><code>bench_trees</code></td><td>38.3</td><td>29.1</td><td>20.2</td><td>1.3&times;</td><td>1.9&times;</td></tr>
+<tr><td><code>bench_method_call</code></td><td>124.2</td><td>95.6</td><td>0.5</td><td>1.3&times;</td><td>263.6&times;</td></tr>
+<tr><td><code>bench_sum</code></td><td>1.6</td><td>5.8</td><td>1.2</td><td>0.3&times;</td><td>1.3&times;</td></tr>
+<tr><td><code>bench_for</code></td><td>3.4</td><td>4.7</td><td>0.6</td><td>0.7&times;</td><td>5.4&times;</td></tr>
+</table>
+
+<h2>Benchmarks</h2>
+
+<h3>bench_fib</h3>
+<p>Naive binary recursion, <code>fib(35)</code>. No loop in the hot path.</p>
+<table class="chart">
+  <tr>
+    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 98.8%;">769.5ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">778.9ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 24.1%;">187.7ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit</th><td><div class="chart-bar luajit" style="width: 6.8%;">53.0ms&nbsp;</div></td>
+  </tr>
+</table>
+<p class="note">The JIT compiled no traces: nothing in the hot path is a loop it can record.</p>
+
+<h3>bench_tak</h3>
+<p>Takeuchi function, <code>tak(24, 16, 8)</code>. Three-argument recursion, no allocation.</p>
+<table class="chart">
+  <tr>
+    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 99.8%;">70.3ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">70.5ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 22.2%;">15.7ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit</th><td><div class="chart-bar luajit" style="width: 8.9%;">6.3ms&nbsp;</div></td>
+  </tr>
+</table>
+<p class="note">The JIT compiled no traces: nothing in the hot path is a loop it can record.</p>
+
+<h3>bench_ack</h3>
+<p>Ackermann, <code>ack(3, 7)</code>. Deep recursion, little work per frame.</p>
+<table class="chart">
+  <tr>
+    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 99.3%;">17.4ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">17.5ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 29.1%;">5.1ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit</th><td><div class="chart-bar luajit" style="width: 5.8%;">1.0ms&nbsp;</div></td>
+  </tr>
+</table>
+<p class="note">The JIT compiled no traces: nothing in the hot path is a loop it can record.</p>
+
+<h3>bench_mutual</h3>
+<p>Two static methods calling each other 500 deep, 2000 times.</p>
+<table class="chart">
+  <tr>
+    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 99.4%;">17.7ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">17.8ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 49.8%;">8.9ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit</th><td><div class="chart-bar luajit" style="width: 1.8%;">0.3ms&nbsp;</div></td>
+  </tr>
+</table>
+<p class="note">The JIT compiled no traces and aborted 1 recording attempt (<code>unsupported CALL_1 receiver type</code>).</p>
+
+<h3>bench_deep</h3>
+<p>Linear recursion 1000 frames deep, 2000 times. Isolates call and return cost.</p>
+<table class="chart">
+  <tr>
+    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 100.0%;">44.9ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 95.9%;">43.1ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 24.5%;">11.0ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit</th><td><div class="chart-bar luajit" style="width: 15.3%;">6.9ms&nbsp;</div></td>
+  </tr>
+</table>
+<p class="note">The JIT compiled no traces and aborted 1 recording attempt (<code>unsupported CALL_1 receiver type</code>).</p>
+
+<h3>bench_trees</h3>
+<p>Recursion plus allocation: builds and walks depth-14 trees 12 times.</p>
+<table class="chart">
+  <tr>
+    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 100.0%;">38.6ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 99.1%;">38.3ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 75.4%;">29.1ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit</th><td><div class="chart-bar luajit" style="width: 52.3%;">20.2ms&nbsp;</div></td>
+  </tr>
+</table>
+<p class="note">The JIT compiled no traces: nothing in the hot path is a loop it can record.</p>
+
+<h3>bench_method_call</h3>
+<p>Three million method calls on a user-defined class. A loop, not recursion.</p>
+<table class="chart">
+  <tr>
+    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 100.0%;">130.5ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 95.2%;">124.2ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 73.2%;">95.6ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit</th><td><div class="chart-bar luajit" style="width: 0.6%;">0.5ms&nbsp;</div></td>
+  </tr>
+</table>
+<p class="note">The JIT compiled no traces and aborted 46 recording attempts (<code>unsupported CALL_0 receiver type</code>).</p>
+
+<h3>bench_sum</h3>
+<p>Sums 0..999999 in a <code>while</code> loop.</p>
+<table class="chart">
+  <tr>
+    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 7.4%;">1.6ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">21.7ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 26.6%;">5.8ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit</th><td><div class="chart-bar luajit" style="width: 5.6%;">1.2ms&nbsp;</div></td>
+  </tr>
+</table>
+<p class="note">The JIT compiled 1 trace.</p>
+
+<h3>bench_for</h3>
+<p>Sums 1..1000000 with <code>for i in 1..n</code>.</p>
+<table class="chart">
+  <tr>
+    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 14.0%;">3.4ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">24.5ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 19.1%;">4.7ms&nbsp;</div></td>
+  </tr>
+  <tr>
+    <th>luajit</th><td><div class="chart-bar luajit" style="width: 2.6%;">0.6ms&nbsp;</div></td>
+  </tr>
+</table>
+<p class="note">The JIT compiled 1 trace.</p>
+
+<h2>Where the time goes</h2>
+
+<p>Sampling the interpreter during <code>fib</code> puts about 82% of samples in
+<code>runInterpreter</code> itself, with the rest spread across
+<code>validateNum</code>, <code>prim_num_lt</code>, <code>prim_num_minus</code>,
+<code>prim_num_plus</code>, and <code>wrenEnsureStack</code>.</p>
+
+<p>That distribution follows from how Wren dispatches arithmetic. An expression
+like <code>n - 1</code> compiles to <code>CALL_1</code>, which looks up the
+receiver's class, bounds-checks the method table, switches on the method type,
+calls a primitive through a function pointer, and validates its argument. LuaJIT's
+interpreter does a type check and the subtraction inline. The same structure that
+makes Wren's method dispatch uniform is what the JIT exists to remove, and on
+recursive code it currently removes none of it.</p>
+
+<div class="meta">
+<p>Measured on Apple M4 Pro on 2026-08-07.<br>
+Wren base <code>99d2f0b</code>, LuaJIT 2.1.1785763465 -- Copyright (C) 2005-2026 Mike Pall. https://luajit.org/.<br>
+Generated by <code>bench/gen_report.py</code> from
+<code>bench/run_benchmarks.py --json</code>.
+Source: <a href="https://github.com/Lulzx/WrenJIT">github.com/Lulzx/WrenJIT</a>.</p>
+</div>
+
+</div>
+</body>
+</html>
