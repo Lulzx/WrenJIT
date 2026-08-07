@@ -31,6 +31,10 @@
 #define OBJ_CLASS_OFFSET ((sljit_sw)offsetof(Obj, classObj))
 #define OBJ_FIELDS_OFFSET ((sljit_sw)offsetof(ObjInstance, fields))
 
+// Maximum native jumps targeting one deoptimization snapshot. Code generation
+// preflights this bound instead of silently dropping an additional guard.
+#define MAX_EXITS_PER_SNAP 64
+
 // ---------------------------------------------------------------------------
 // Register mapping: convert RegAlloc pool indices to SLJIT registers.
 // ---------------------------------------------------------------------------
@@ -148,6 +152,33 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
 {
     if (!ir || ir->count == 0) return NULL;
 
+    uint16_t exitsPerSnapshot[IR_MAX_SNAPSHOTS];
+    memset(exitsPerSnapshot, 0, sizeof(exitsPerSnapshot));
+    for (uint16_t i = 0; i < ir->count; i++) {
+        const IRNode* n = &ir->nodes[i];
+        if ((n->flags & IR_FLAG_DEAD) || n->op == IR_NOP) continue;
+        uint16_t sid = IR_NONE;
+        uint16_t needed = 0;
+        if (n->op == IR_GUARD_CLASS) {
+            sid = n->op2;
+            needed = 1;
+        } else if (n->op == IR_GUARD_NUM || n->op == IR_GUARD_BOOL ||
+                   n->op == IR_GUARD_TRUE || n->op == IR_GUARD_FALSE ||
+                   n->op == IR_GUARD_NOT_NULL || n->op == IR_SIDE_EXIT) {
+            sid = n->imm.snapshot_id;
+            needed = 1;
+        }
+        if (n->flags & IR_FLAG_INT_GUARD) {
+            sid = n->imm.snapshot_id;
+            needed = n->op == IR_UNBOX_INT ? 3 : 2;
+        }
+        if (sid != IR_NONE && sid < IR_MAX_SNAPSHOTS) {
+            if ((uint32_t)exitsPerSnapshot[sid] + needed > MAX_EXITS_PER_SNAP)
+                return NULL;
+            exitsPerSnapshot[sid] = (uint16_t)(exitsPerSnapshot[sid] + needed);
+        }
+    }
+
     struct sljit_compiler* C = sljit_create_compiler(NULL);
     if (!C) return NULL;
 
@@ -181,7 +212,6 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
         (size_t)(maxSnapshots + 1), sizeof(struct sljit_jump*));
     // We'll chain multiple jumps per snapshot via a parallel array.
     // Simple approach: store up to 16 jumps per snapshot.
-    #define MAX_EXITS_PER_SNAP 16
     struct sljit_jump* exitJumpArr[IR_MAX_SNAPSHOTS][MAX_EXITS_PER_SNAP];
     int exitJumpCount[IR_MAX_SNAPSHOTS];
     memset(exitJumpCount, 0, sizeof(exitJumpCount));
