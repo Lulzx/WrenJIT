@@ -97,11 +97,38 @@ Recursive calls do not form a traceable hot loop; JIT has no effect.
 
 Requires CMake 3.16+ and a C99 compiler.
 
+Wren and SLJIT are submodules pinned to upstream commits. The JIT needs a
+handful of hooks inside the Wren VM, which live in `patches/` rather than in a
+fork, so `vendor/wren` stays a verbatim upstream checkout. `scripts/setup.sh`
+fetches both submodules and applies the patch; re-running it is safe.
+
 ```sh
+git clone --recurse-submodules https://github.com/Lulzx/WrenJIT.git
+cd WrenJIT
+./scripts/setup.sh
 cmake -B build
 cmake --build build
 ./build/test_jit
 ```
+
+Pinned versions:
+
+| dependency | upstream | commit |
+|------------|----------|--------|
+| Wren  | [wren-lang/wren](https://github.com/wren-lang/wren) | `99d2f0b` |
+| SLJIT | [zherczeg/sljit](https://github.com/zherczeg/sljit) | `d9902b1` |
+
+### Wren VM patch
+
+`patches/0001-wren-jit-hooks.patch` adds, all behind `#ifdef WREN_JIT`:
+
+- `WrenVM.jit` (JIT state) and `WrenVM.jitHotCounts` (hot-loop counters) in `wren_vm.h`
+- JIT init/teardown in `wrenNewVM`/`wrenFreeVM`
+- A trace-recording hook on the interpreter dispatch path
+- Trace lookup, execution, side-exit restore, and hot-counter bump in the `CODE_LOOP` handler
+
+With `-DWREN_JIT=OFF` the patch compiles out entirely, so a patched `vendor/wren`
+still builds as stock Wren.
 
 To disable the JIT:
 
@@ -141,8 +168,10 @@ src/jit/
   wren_jit_snapshot.c snapshot construction and writeback
   wren_jit_memory.c   executable memory allocation (mmap/VirtualAlloc)
 vendor/
-  wren/               upstream Wren VM (instrumented behind #ifdef WREN_JIT)
+  wren/               upstream Wren VM, patched by scripts/setup.sh
   sljit/              SLJIT portable JIT backend
+patches/
+  0001-wren-jit-hooks.patch  JIT hooks for the Wren VM (#ifdef WREN_JIT)
 ```
 
 ## License

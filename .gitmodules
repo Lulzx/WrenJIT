@@ -1,0 +1,6 @@
+[submodule "vendor/wren"]
+	path = vendor/wren
+	url = https://github.com/wren-lang/wren.git
+[submodule "vendor/sljit"]
+	path = vendor/sljit
+	url = https://github.com/zherczeg/sljit.git

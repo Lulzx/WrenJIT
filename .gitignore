@@ -6,3 +6,5 @@ build-nojit/
 *.d
 *.dylib
 *.so
+build_asan/
+build_perf/

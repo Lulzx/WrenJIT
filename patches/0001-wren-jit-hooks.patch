@@ -1,0 +1,189 @@
+diff --git a/src/vm/wren_value.h b/src/vm/wren_value.h
+index 2ca0cfd..001f794 100644
+--- a/src/vm/wren_value.h
++++ b/src/vm/wren_value.h
+@@ -265,6 +265,12 @@ typedef struct
+   // only be set for fns, and not ObjFns that represent methods or scripts.
+   int arity;
+   FnDebug* debug;
++
++#ifdef WREN_JIT
++  // Per-loop-header hot counters, allocated lazily by the JIT.
++  // Indexed by bytecode offset of LOOP instructions.
++  uint16_t* jitHotCounts;
++#endif
+ } ObjFn;
+ 
+ // An instance of a first-class function and the environment it has closed over.
+diff --git a/src/vm/wren_vm.c b/src/vm/wren_vm.c
+index f63ab8c..d3cfc69 100644
+--- a/src/vm/wren_vm.c
++++ b/src/vm/wren_vm.c
+@@ -16,6 +16,11 @@
+   #include "wren_opt_random.h"
+ #endif
+ 
++#ifdef WREN_JIT
++  #include "wren_jit.h"
++  #include "wren_jit_trace.h"
++#endif
++
+ #if WREN_DEBUG_TRACE_MEMORY || WREN_DEBUG_TRACE_GC
+   #include <time.h>
+   #include <stdio.h>
+@@ -93,6 +98,11 @@ WrenVM* wrenNewVM(WrenConfiguration* config)
+ 
+   vm->modules = wrenNewMap(vm);
+   wrenInitializeCore(vm);
++
++#ifdef WREN_JIT
++  vm->jit = wrenJitInit(vm);
++#endif
++
+   return vm;
+ }
+ 
+@@ -119,6 +129,14 @@ void wrenFreeVM(WrenVM* vm)
+ 
+   wrenSymbolTableClear(vm, &vm->methodNames);
+ 
++#ifdef WREN_JIT
++  if (vm->jit != NULL)
++  {
++    wrenJitFree(vm, vm->jit);
++    vm->jit = NULL;
++  }
++#endif
++
+   DEALLOCATE(vm, vm);
+ }
+ 
+@@ -887,6 +905,28 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+     #define DEBUG_TRACE_INSTRUCTIONS() do { } while (false)
+   #endif
+ 
++  // JIT recording hook: call the trace recorder for every instruction while
++  // recording.  This is a single predicted-not-taken branch when idle.
++  #ifdef WREN_JIT
++    #define JIT_TRACE_INSTRUCTION()                                            \
++        do                                                                     \
++        {                                                                      \
++          if (vm->jit != NULL && wrenJitIsRecording(vm->jit))                  \
++          {                                                                    \
++            STORE_FRAME();                                                     \
++            bool jitDone_ = jitRecorderStep(vm->jit, vm, ip);                 \
++            LOAD_FRAME();                                                      \
++            if (jitDone_) {                                                    \
++              STORE_FRAME();                                                   \
++              wrenJitCompileAndStore(vm, vm->jit, fiber, frame);               \
++              LOAD_FRAME();                                                    \
++            }                                                                  \
++          }                                                                    \
++        } while (false)
++  #else
++    #define JIT_TRACE_INSTRUCTION() do { } while (false)
++  #endif
++
+   #if WREN_COMPUTED_GOTO
+ 
+   static void* dispatchTable[] = {
+@@ -902,6 +942,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+       do                                                                       \
+       {                                                                        \
+         DEBUG_TRACE_INSTRUCTIONS();                                            \
++        JIT_TRACE_INSTRUCTION();                                               \
+         goto *dispatchTable[instruction = (Code)READ_BYTE()];                  \
+       } while (false)
+ 
+@@ -910,6 +951,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+   #define INTERPRET_LOOP                                                       \
+       loop:                                                                    \
+         DEBUG_TRACE_INSTRUCTIONS();                                            \
++        JIT_TRACE_INSTRUCTION();                                               \
+         switch (instruction = (Code)READ_BYTE())
+ 
+   #define CASE_CODE(name)  case CODE_##name
+@@ -1158,6 +1200,50 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+       // Jump back to the top of the loop.
+       uint16_t offset = READ_SHORT();
+       ip -= offset;
++
++#ifdef WREN_JIT
++      if (vm->jit != NULL && vm->jit->enabled)
++      {
++        // 1. Check for existing compiled trace.
++        JitTrace* jitTrace = wrenJitLookup(vm->jit, ip);
++        if (jitTrace != NULL)
++        {
++          STORE_FRAME();
++          int jitResult = wrenJitExecute(vm, jitTrace);
++          // Restore interpreter state from the side-exit snapshot.
++          // exitIdx is 0-based (jitResult - 1).
++          if (jitResult != 0)
++          {
++            wrenJitRestoreExit(vm, vm->jit, fiber, frame,
++                               jitTrace, jitResult - 1);
++          }
++          LOAD_FRAME();
++          DISPATCH();
++        }
++
++        // 2. If recording, the dispatch hook (JIT_TRACE_INSTRUCTION) handles
++        // loop-back detection and compilation. Nothing to do here.
++        if (wrenJitIsRecording(vm->jit))
++        {
++          DISPATCH();
++        }
++
++        // 3. Not recording and no trace: increment hot counter.
++        {
++          int pcOffset = (int)(ip - fn->code.data);
++          if (wrenJitIncrementHot(vm->jit, fn->code.data,
++                                   vm->jitHotCounts, pcOffset))
++          {
++            // Loop just became hot - start recording.
++            STORE_FRAME();
++            jitRecorderStart(vm->jit, ip,
++                              (int)(fiber->stackTop - stackStart));
++            LOAD_FRAME();
++          }
++        }
++      }
++#endif /* WREN_JIT */
++
+       DISPATCH();
+     }
+ 
+diff --git a/src/vm/wren_vm.h b/src/vm/wren_vm.h
+index 7ab74c9..e5ada59 100644
+--- a/src/vm/wren_vm.h
++++ b/src/vm/wren_vm.h
+@@ -6,6 +6,10 @@
+ #include "wren_value.h"
+ #include "wren_utils.h"
+ 
++#ifdef WREN_JIT
++typedef struct WrenJitState WrenJitState;
++#endif
++
+ // The maximum number of temporary objects that can be made visible to the GC
+ // at one time.
+ #define WREN_MAX_TEMP_ROOTS 8
+@@ -100,7 +104,16 @@ struct WrenVM
+   Value* apiStack;
+ 
+   WrenConfiguration config;
+-  
++
++#ifdef WREN_JIT
++  // JIT compiler state. NULL if JIT is not initialized.
++  WrenJitState* jit;
++
++  // Per-loop hotness counters indexed by hash(fn, pcOffset).
++  // Using a flat array in the VM avoids per-function allocation.
++  uint16_t jitHotCounts[65536];
++#endif
++
+   // Compiler and debugger data:
+ 
+   // The compiler that is currently compiling code. This is used so that heap
