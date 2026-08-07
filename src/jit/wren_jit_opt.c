@@ -41,9 +41,21 @@ static inline bool isCmp(IROp op)
 
 static inline bool isGuard(IROp op)
 {
-    return op == IR_GUARD_NUM    || op == IR_GUARD_CLASS ||
+    return op == IR_GUARD_NUM    || op == IR_GUARD_BOOL ||
+           op == IR_GUARD_CLASS ||
            op == IR_GUARD_TRUE   || op == IR_GUARD_FALSE ||
            op == IR_GUARD_NOT_NULL;
+}
+
+// Return the deoptimization snapshot used by a guard/exit node.
+static uint16_t exitSnapshotId(const IRNode* n)
+{
+    if (n->op == IR_GUARD_CLASS) return n->op2;
+    if (n->op == IR_SIDE_EXIT || n->op == IR_GUARD_NUM ||
+        n->op == IR_GUARD_BOOL ||
+        n->op == IR_GUARD_TRUE || n->op == IR_GUARD_FALSE ||
+        n->op == IR_GUARD_NOT_NULL) return n->imm.snapshot_id;
+    return IR_NONE;
 }
 
 static inline bool isConst(IROp op)
@@ -60,6 +72,7 @@ static bool hasSideEffect(const IRNode* n)
         case IR_STORE_FIELD:
         case IR_STORE_MODULE_VAR:
         case IR_GUARD_NUM:
+        case IR_GUARD_BOOL:
         case IR_GUARD_CLASS:
         case IR_GUARD_TRUE:
         case IR_GUARD_FALSE:
@@ -99,6 +112,10 @@ static void replaceUses(IRBuffer* buf, uint16_t old, uint16_t rep)
     for (uint16_t i = 0; i < buf->snapshot_entry_count; i++) {
         if (buf->snapshot_entries[i].ssa_ref == old)
             buf->snapshot_entries[i].ssa_ref = rep;
+    }
+    for (uint16_t i = 0; i < buf->exit_module_entry_count; i++) {
+        if (buf->exit_module_entries[i].ssa_ref == old)
+            buf->exit_module_entries[i].ssa_ref = rep;
     }
 }
 
@@ -656,6 +673,10 @@ void irOptLICM(IRBuffer* buf)
                 }
                 if (written) continue; // leave not-invariant
             }
+            // Keep field reads in the loop. Besides stores/calls, moving a
+            // field load changes its SSA id and can invalidate the register
+            // lifetime expected by field consumers after LICM compaction.
+            if (n->op == IR_LOAD_FIELD) continue;
 
             bool invariant = true;
 
@@ -1127,6 +1148,15 @@ void irOptDCE(IRBuffer* buf)
         }
     }
 
+    // Deferred module stores are also deoptimization roots.
+    for (uint16_t i = 0; i < buf->exit_module_entry_count; i++) {
+        uint16_t ref = buf->exit_module_entries[i].ssa_ref;
+        if (ref != IR_NONE && ref < buf->count && !bitTest(live, ref)) {
+            bitSet(live, ref);
+            worklist[wlCount++] = ref;
+        }
+    }
+
     // Propagate liveness to operands.
     while (wlCount > 0) {
         uint16_t id = worklist[--wlCount];
@@ -1212,17 +1242,33 @@ void irOptPromoteLoopVars(IRBuffer* buf)
         }
         if (unbox_id == IR_NONE) continue;
 
-        // Find the matching STORE_MODULE_VAR for the same variable.
+        // Require exactly one matching store. Multiple assignments need a
+        // real memory-SSA merge and must not be guessed from the first store.
         uint16_t store_id = IR_NONE;
+        int store_count = 0;
         for (uint16_t s = header + 1; s < back; s++) {
             const IRNode* sn = &buf->nodes[s];
             if (sn->flags & IR_FLAG_DEAD) continue;
             if (sn->op == IR_STORE_MODULE_VAR && sn->imm.ptr == var_ptr) {
                 store_id = s;
+                store_count++;
+            }
+        }
+        if (store_count != 1) continue;
+
+        // This simple PHI form models one assignment at the end of an
+        // iteration. A load after the assignment would need the back-edge
+        // value immediately rather than the current PHI.
+        bool load_after_store = false;
+        for (uint16_t k = (uint16_t)(store_id + 1); k < back; k++) {
+            const IRNode* kn = &buf->nodes[k];
+            if (!(kn->flags & IR_FLAG_DEAD) &&
+                kn->op == IR_LOAD_MODULE_VAR && kn->imm.ptr == var_ptr) {
+                load_after_store = true;
                 break;
             }
         }
-        if (store_id == IR_NONE) continue;
+        if (load_after_store) continue;
 
         // The stored value must be BOX_NUM(back_val) so we can recover the
         // unboxed arithmetic result as the PHI's back-edge value.
@@ -1275,6 +1321,48 @@ void irOptPromoteLoopVars(IRBuffer* buf)
             j2n->type  = IR_TYPE_NUM;
             j2n->flags = 0;
             memset(&j2n->imm, 0, sizeof(j2n->imm));
+        }
+
+        // If every use of a snapshot is on a single side of the assignment,
+        // defer the module write to that snapshot's exit stub. This removes
+        // both the memory traffic and (when otherwise unused) boxing from the
+        // hot back edge. Calls are an aliasing boundary, so traces containing
+        // one retain the eager store.
+        bool can_sink_store = true;
+        int8_t snapshot_side[IR_MAX_SNAPSHOTS];
+        memset(snapshot_side, -1, sizeof(snapshot_side));
+        for (uint16_t k = header + 1; k < back; k++) {
+            const IRNode* kn = &buf->nodes[k];
+            if (kn->flags & IR_FLAG_DEAD) continue;
+            if (kn->op == IR_CALL_C || kn->op == IR_CALL_WREN) {
+                can_sink_store = false;
+                break;
+            }
+            uint16_t sid = exitSnapshotId(kn);
+            if (sid == IR_NONE || sid >= buf->snapshot_count) continue;
+            int8_t side = k > store_id ? 1 : 0;
+            if (snapshot_side[sid] != -1 && snapshot_side[sid] != side) {
+                can_sink_store = false;
+                break;
+            }
+            snapshot_side[sid] = side;
+        }
+
+        if (can_sink_store) {
+            int needed = 0;
+            for (uint16_t sid = 0; sid < buf->snapshot_count; sid++)
+                if (snapshot_side[sid] != -1) needed++;
+            if ((int)buf->exit_module_entry_count + needed <= IR_MAX_EXIT_MODULE_ENTRIES) {
+                for (uint16_t sid = 0; sid < buf->snapshot_count; sid++) {
+                    if (snapshot_side[sid] == -1) continue;
+                    IRExitModuleEntry* entry =
+                        &buf->exit_module_entries[buf->exit_module_entry_count++];
+                    entry->address = var_ptr;
+                    entry->snapshot_id = sid;
+                    entry->ssa_ref = snapshot_side[sid] ? back_val_id : j2;
+                }
+                killNode(&buf->nodes[store_id]);
+            }
         }
 
         // Replace ALL in-loop LOAD_MODULE_VAR(var_ptr) nodes with j0, and

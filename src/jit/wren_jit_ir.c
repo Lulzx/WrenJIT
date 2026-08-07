@@ -114,6 +114,14 @@ uint16_t irEmitGuardClass(IRBuffer* buf, uint16_t val, void* classPtr,
     return id;
 }
 
+uint16_t irEmitGuardBool(IRBuffer* buf, uint16_t val, uint16_t snapshot)
+{
+    uint16_t id = irEmit(buf, IR_GUARD_BOOL, val, IR_NONE, IR_TYPE_VOID);
+    buf->nodes[id].imm.snapshot_id = snapshot;
+    buf->nodes[id].flags |= IR_FLAG_GUARD;
+    return id;
+}
+
 uint16_t irEmitGuardTrue(IRBuffer* buf, uint16_t val, uint16_t snapshot)
 {
     uint16_t id = irEmit(buf, IR_GUARD_TRUE, val, IR_NONE, IR_TYPE_VOID);
@@ -252,10 +260,12 @@ const char* irOpName(IROp op)
     case IR_BOX_OBJ:        return "BOX_OBJ";
     case IR_UNBOX_OBJ:      return "UNBOX_OBJ";
     case IR_BOX_BOOL:       return "BOX_BOOL";
+    case IR_BOOL_NOT:       return "BOOL_NOT";
     case IR_UNBOX_INT:      return "UNBOX_INT";
     case IR_BOX_INT:        return "BOX_INT";
     case IR_GUARD_NUM:      return "GUARD_NUM";
     case IR_GUARD_CLASS:    return "GUARD_CLASS";
+    case IR_GUARD_BOOL:     return "GUARD_BOOL";
     case IR_GUARD_TRUE:     return "GUARD_TRUE";
     case IR_GUARD_FALSE:    return "GUARD_FALSE";
     case IR_GUARD_NOT_NULL: return "GUARD_NOT_NULL";
@@ -305,6 +315,7 @@ void irBufferDump(const IRBuffer* buf)
             printf(" snap=%d", n->imm.snapshot_id);
             break;
         case IR_GUARD_NUM:
+        case IR_GUARD_BOOL:
         case IR_GUARD_TRUE:
         case IR_GUARD_FALSE:
         case IR_GUARD_NOT_NULL:

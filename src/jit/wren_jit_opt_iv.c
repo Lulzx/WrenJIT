@@ -45,6 +45,23 @@ static bool isIntType(const IRBuffer* buf, uint16_t id)
     return buf->nodes[id].type == IR_TYPE_INT;
 }
 
+// Use the bytecode snapshot immediately preceding an integer operation.  For
+// pre-header conversions there is no preceding snapshot, so use the first loop
+// snapshot.  It contains the original boxed module values and is therefore a
+// valid deoptimization state if integer specialization is not applicable.
+static uint16_t snapshotForNode(const IRBuffer* buf, uint16_t id)
+{
+    uint16_t snap = IR_NONE;
+    for (uint16_t i = 0; i < id; i++) {
+        if (buf->nodes[i].op == IR_SNAPSHOT) snap = buf->nodes[i].imm.snapshot_id;
+    }
+    if (snap != IR_NONE) return snap;
+    for (uint16_t i = id; i < buf->count; i++) {
+        if (buf->nodes[i].op == IR_SNAPSHOT) return buf->nodes[i].imm.snapshot_id;
+    }
+    return IR_NONE;
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -86,9 +103,11 @@ void irOptIVTypeInference(IRBuffer* buf)
             // Pre-loop value must be an integer constant, INT, or NUM type.
             // We accept NUM because irOptPromoteLoopVars places UNBOX_NUM
             // (type NUM) as the initial value in the pre-header PHI.
+            // A generic NUM has no proof that its runtime value is integral.
+            // Promoted module variables arrive as UNBOX_NUM, so keep them on
+            // the FP path rather than truncating fractions or huge doubles.
             if (!isIntegerConstNum(preNode) &&
-                preNode->type != IR_TYPE_INT &&
-                preNode->type != IR_TYPE_NUM) continue;
+                preNode->type != IR_TYPE_INT) continue;
 
             // Back-edge must be ADD or SUB of (phi, const/int) or (const/int, phi).
             bool backIsIV = false;
@@ -148,6 +167,11 @@ void irOptIVTypeInference(IRBuffer* buf)
                             b->type    = IR_TYPE_INT;
                         }
                         n->type = IR_TYPE_INT;
+                        uint16_t snap = snapshotForNode(buf, i);
+                        if (snap != IR_NONE) {
+                            n->flags |= IR_FLAG_INT_GUARD;
+                            n->imm.snapshot_id = snap;
+                        }
                         changed = true;
                     }
                     break;
@@ -185,6 +209,11 @@ void irOptIVTypeInference(IRBuffer* buf)
         if (!(preVal->flags & IR_FLAG_DEAD) && preVal->op == IR_UNBOX_NUM) {
             preVal->op   = IR_UNBOX_INT;
             preVal->type = IR_TYPE_INT;
+            uint16_t snap = snapshotForNode(buf, phi->op1);
+            if (snap != IR_NONE) {
+                preVal->flags |= IR_FLAG_INT_GUARD;
+                preVal->imm.snapshot_id = snap;
+            }
         }
     }
 

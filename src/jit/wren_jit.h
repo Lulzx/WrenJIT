@@ -17,6 +17,9 @@ typedef struct sObjClass ObjClass;
 // JIT hot count threshold
 #define JIT_HOT_THRESHOLD 50
 
+// Sentinel stored in a loop counter after recording or compilation fails.
+#define JIT_HOT_BLACKLISTED UINT16_MAX
+
 // Maximum traces in the cache
 #define JIT_MAX_TRACES 1024
 
@@ -71,6 +74,7 @@ typedef struct WrenJitState {
     uint8_t* anchor_pc;              // PC where recording started
     int record_depth;                // call depth during recording
     int record_count;                // instructions recorded so far
+    uint16_t* active_hot_count;       // counter for the trace being recorded
 
     // Slot map: maps interpreter stack slots to IR SSA values during recording
     uint16_t* slot_map;
@@ -112,10 +116,12 @@ JitTrace* wrenJitLookup(WrenJitState* jit, uint8_t* pc);
 // Execute a compiled trace. Returns 0 on success, exit index on side exit.
 int wrenJitExecute(WrenVM* vm, JitTrace* trace);
 
-// Increment hot count for a loop at the given PC in the given function.
-// Returns true if the loop just became hot (should start recording).
-bool wrenJitIncrementHot(WrenJitState* jit, uint8_t* bytecode,
-                          uint16_t* hot_counts, int pc_offset);
+// Increment a loop's per-function hot counter. Returns true exactly once when
+// it becomes hot. Blacklisted and already-hot counters require no write.
+bool wrenJitIncrementHot(WrenJitState* jit, uint16_t* hot_count);
+
+// Permanently suppress recording attempts for the currently active loop.
+void wrenJitBlacklistCurrent(WrenJitState* jit);
 
 // Start recording a trace at the given PC.
 void wrenJitStartRecording(WrenJitState* jit, uint8_t* pc);

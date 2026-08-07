@@ -207,6 +207,68 @@ bool jitTryWidenCall1(WrenJitState* jit, WrenVM* vm, Value* stackStart,
 bool jitTryWidenCall0(WrenJitState* jit, WrenVM* vm, Value* stackStart,
                       uint16_t symbol, uint8_t* ip)
 {
-    (void)jit; (void)vm; (void)stackStart; (void)symbol; (void)ip;
-    return false;
+    JitRecorder* r = jitRecorderGet(jit);
+    if (!r || r->aborted || r->stack_top < 1) return false;
+
+    int recv_slot = r->stack_top - 1;
+    Value recv_val = stackStart[recv_slot];
+    if (!IS_INSTANCE(recv_val)) return false;
+
+    ObjInstance* instance = AS_INSTANCE(recv_val);
+    ObjClass* classObj = instance->obj.classObj;
+    if (symbol >= (uint16_t)classObj->methods.count) return false;
+    Method* method = &classObj->methods.data[symbol];
+    if (method->type != METHOD_BLOCK || method->as.closure == NULL) return false;
+
+    ObjFn* fn = method->as.closure->fn;
+    if (fn == NULL || fn->numUpvalues != 0) return false;
+    uint8_t* code = fn->code.data;
+    int count = fn->code.count;
+
+    // Admit only compiler-canonical, straight-line methods. Besides making
+    // this deliberately small, exact matching ensures no callee side effect
+    // is lost when its interpreter bytecodes are suppressed below.
+    bool getter = count == 4 &&
+                  code[0] == CODE_LOAD_FIELD_THIS &&
+                  code[2] == CODE_RETURN && code[3] == CODE_END;
+    bool toggler = count == 9 &&
+                   code[0] == CODE_LOAD_FIELD_THIS &&
+                   code[2] == CODE_CALL_0 &&
+                   code[5] == CODE_STORE_FIELD_THIS &&
+                   code[7] == CODE_RETURN && code[8] == CODE_END &&
+                   code[1] == code[6] &&
+                   widenMethodNameEquals(vm,
+                       (int)(((uint16_t)code[3] << 8) | code[4]), "!");
+    if (!getter && !toggler) return false;
+
+    uint16_t field = code[1];
+    if (field >= (uint16_t)classObj->numFields) return false;
+
+    uint16_t snap = widenEmitSnapshot(r, ip);
+    uint16_t recv_ssa = widenSlotGet(r, recv_slot);
+    if (recv_ssa == IR_NONE) {
+        recv_ssa = irEmitLoad(&r->ir, (uint16_t)recv_slot);
+        widenSlotSet(r, recv_slot, recv_ssa);
+    }
+    irEmitGuardClass(&r->ir, recv_ssa, classObj, snap);
+    uint16_t obj = recv_ssa;
+    uint16_t value = irEmitLoadField(&r->ir, obj, field);
+
+    if (toggler) {
+        // `!` accepts every Wren value, but XOR only models its boolean case.
+        // A type guard preserves general semantics by side-exiting for a field
+        // that has changed to null, a number, or an object since recording.
+        irEmitGuardBool(&r->ir, value, snap);
+        value = irEmit(&r->ir, IR_BOOL_NOT, value, IR_NONE, IR_TYPE_VALUE);
+        irEmitStoreField(&r->ir, obj, field, value);
+    }
+
+    widenSlotSet(r, recv_slot, value);
+
+    // The real interpreter still enters this METHOD_BLOCK. Its result and
+    // side effect agree with the IR above, but recording those callee bytecodes
+    // would corrupt the caller-relative slot map. jitRecorderStep skips hooks
+    // until this frame depth is restored.
+    r->suppressed_frame_depth = vm->fiber->numFrames;
+    return true;
 }

@@ -431,6 +431,7 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                 sljit_emit_fop1(C, SLJIT_CONV_SW_FROM_F64,
                                 dstReg, 0, SLJIT_FR0, 0);
             }
+
             break;
         }
 
@@ -464,6 +465,31 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                 sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff, SLJIT_R0, 0);
             } else {
                 sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, SLJIT_FR0, dstReg);
+            }
+            break;
+        }
+
+        case IR_BOOL_NOT: {
+            // Wren's boolean tags differ only in bit zero. The recorder emits
+            // GUARD_BOOL before this operation, so XOR is a complete and safe
+            // implementation of logical negation for the admitted pattern.
+            uint16_t valId = n->op1;
+            if (valId == IR_NONE) break;
+            int srcReg, srcMem; sljit_sw srcOff;
+            int dstReg, dstMem; sljit_sw dstOff;
+            getGP(ra, valId, &srcReg, &srcMem, &srcOff);
+            getGP(ra, n->id, &dstReg, &dstMem, &dstOff);
+            if (srcMem) {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, srcOff);
+                srcReg = SLJIT_R0;
+            }
+            if (dstMem) {
+                sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0, srcReg, 0,
+                               SLJIT_IMM, 1);
+                sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff, SLJIT_R0, 0);
+            } else {
+                sljit_emit_op2(C, SLJIT_XOR, dstReg, 0, srcReg, 0,
+                               SLJIT_IMM, 1);
             }
             break;
         }
@@ -601,6 +627,25 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                     sljit_emit_op1(C, SLJIT_MOV, dr, dof, SLJIT_R0, 0);
                 } else {
                     sljit_emit_op2(C, iop, dr, 0, a, 0, b, 0);
+                }
+
+                if (n->flags & IR_FLAG_INT_GUARD) {
+                    uint16_t snapId = n->imm.snapshot_id;
+                    int resultReg = dr;
+                    if (dm) {
+                        sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, dr, dof);
+                        resultReg = SLJIT_R0;
+                    }
+                    struct sljit_jump* checks[2];
+                    checks[0] = sljit_emit_cmp(C, SLJIT_SIG_GREATER,
+                        resultReg, 0, SLJIT_IMM, (sljit_sw)(1LL << 53));
+                    checks[1] = sljit_emit_cmp(C, SLJIT_SIG_LESS,
+                        resultReg, 0, SLJIT_IMM, (sljit_sw)-(1LL << 53));
+                    for (int ck = 0; ck < 2; ck++) {
+                        if (snapId < (uint16_t)maxSnapshots &&
+                            exitJumpCount[snapId] < MAX_EXITS_PER_SNAP)
+                            exitJumpArr[snapId][exitJumpCount[snapId]++] = checks[ck];
+                    }
                 }
                 break;
             }
@@ -798,6 +843,30 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             break;
         }
 
+        case IR_GUARD_BOOL: {
+            // FALSE_VAL and TRUE_VAL differ only in bit zero. Mask that bit
+            // and reject every other Wren value before BOOL_NOT can use XOR.
+            uint16_t valId = n->op1;
+            uint16_t snapId = n->imm.snapshot_id;
+            if (valId == IR_NONE) break;
+            int srcReg, srcMem; sljit_sw srcOff;
+            getGP(ra, valId, &srcReg, &srcMem, &srcOff);
+            if (srcMem) {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, srcOff);
+            } else {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, 0);
+            }
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, (sljit_sw)~(sljit_uw)1);
+            struct sljit_jump* jmp = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+                SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)WREN_FALSE_VAL);
+            if (snapId < (uint16_t)maxSnapshots &&
+                exitJumpCount[snapId] < MAX_EXITS_PER_SNAP) {
+                exitJumpArr[snapId][exitJumpCount[snapId]++] = jmp;
+            }
+            break;
+        }
+
         case IR_GUARD_CLASS: {
             // Check obj->classObj == expected class pointer.
             uint16_t valId = n->op1;
@@ -948,6 +1017,44 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
 
         // ----- Control flow -----
         case IR_LOOP_HEADER: {
+            // Validate pre-header integer conversions only after every
+            // pre-header value has been materialized. Side-exit snapshots may
+            // reference constants defined after the UNBOX_INT node.
+            for (uint16_t p = 0; p < i; p++) {
+                const IRNode* conv = &ir->nodes[p];
+                if (conv->op != IR_UNBOX_INT ||
+                    !(conv->flags & IR_FLAG_INT_GUARD)) continue;
+
+                int vr, vm; sljit_sw vo;
+                int irg, im; sljit_sw io;
+                getGP(ra, conv->op1, &vr, &vm, &vo);
+                getGP(ra, conv->id, &irg, &im, &io);
+                if (vm) {
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, vr, vo);
+                    vr = SLJIT_R0;
+                }
+                sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, vr);
+                if (im) {
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, irg, io);
+                    irg = SLJIT_R1;
+                }
+                sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW,
+                                SLJIT_FR1, 0, irg, 0);
+
+                uint16_t snapId = conv->imm.snapshot_id;
+                struct sljit_jump* checks[3];
+                checks[0] = sljit_emit_fcmp(C, SLJIT_UNORDERED_OR_NOT_EQUAL,
+                                            SLJIT_FR0, 0, SLJIT_FR1, 0);
+                checks[1] = sljit_emit_cmp(C, SLJIT_SIG_GREATER,
+                    irg, 0, SLJIT_IMM, (sljit_sw)(1LL << 53));
+                checks[2] = sljit_emit_cmp(C, SLJIT_SIG_LESS,
+                    irg, 0, SLJIT_IMM, (sljit_sw)-(1LL << 53));
+                for (int ck = 0; ck < 3; ck++) {
+                    if (snapId < (uint16_t)maxSnapshots &&
+                        exitJumpCount[snapId] < MAX_EXITS_PER_SNAP)
+                        exitJumpArr[snapId][exitJumpCount[snapId]++] = checks[ck];
+                }
+            }
             loopHeaderLabel = sljit_emit_label(C);
             break;
         }
@@ -1130,7 +1237,10 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                 sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, objReg, 0);
             }
 
-            // Fields start at offset 24 (after Obj header).
+            // IR field operands are boxed Wren object Values. Unmask before
+            // dereferencing (the interpreter recorder uses the same contract).
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0, SLJIT_R1, 0,
+                           SLJIT_IMM, (sljit_sw)~(WREN_SIGN_BIT | WREN_QNAN));
             sljit_sw fieldOff = 24 + (sljit_sw)(fieldIdx * 8);
 
             int dstReg, dstMem; sljit_sw dstOff;
@@ -1163,6 +1273,8 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                 sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, objReg, 0);
             }
 
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0, SLJIT_R1, 0,
+                           SLJIT_IMM, (sljit_sw)~(WREN_SIGN_BIT | WREN_QNAN));
             sljit_sw fieldOff = 24 + (sljit_sw)(fieldIdx * 8);
 
             int srcReg, srcMem; sljit_sw srcOff;
@@ -1278,6 +1390,51 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
 
     for (int si = 0; si < maxSnapshots; si++) {
         exitLabels[si] = sljit_emit_label(C);
+
+        // Materialize module stores that were sunk out of the hot loop.
+        for (uint16_t me = 0; me < ir->exit_module_entry_count; me++) {
+            const IRExitModuleEntry* entry = &ir->exit_module_entries[me];
+            if (entry->snapshot_id != (uint16_t)si ||
+                entry->ssa_ref >= ir->count) continue;
+
+            uint16_t ref = entry->ssa_ref;
+            IRType type = ir->nodes[ref].type;
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                           SLJIT_IMM, (sljit_sw)(uintptr_t)entry->address);
+
+            if (type == IR_TYPE_NUM) {
+                int sr, sm; sljit_sw so;
+                getFP(ra, ref, &sr, &sm, &so);
+                if (sm) {
+                    sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR0, 0, sr, so);
+                    sr = SLJIT_FR0; so = 0;
+                }
+                // A Wren numeric Value is exactly the IEEE-754 bit pattern,
+                // so an FP store performs boxing and the module write at once.
+                sljit_emit_fop1(C, SLJIT_MOV_F64,
+                                SLJIT_MEM1(SLJIT_R1), 0, sr, so);
+            } else if (type == IR_TYPE_INT) {
+                int sr, sm; sljit_sw so;
+                getGP(ra, ref, &sr, &sm, &so);
+                if (sm) {
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, sr, so);
+                    sr = SLJIT_R0;
+                }
+                sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW,
+                                SLJIT_FR0, 0, sr, 0);
+                sljit_emit_fop1(C, SLJIT_MOV_F64,
+                                SLJIT_MEM1(SLJIT_R1), 0, SLJIT_FR0, 0);
+            } else {
+                int sr, sm; sljit_sw so;
+                getGP(ra, ref, &sr, &sm, &so);
+                if (sm) {
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, sr, so);
+                    sr = SLJIT_R0; so = 0;
+                }
+                sljit_emit_op1(C, SLJIT_MOV,
+                               SLJIT_MEM1(SLJIT_R1), 0, sr, so);
+            }
+        }
 
         // Write back all snapshot-captured SSA values to the interpreter stack
         // so the interpreter can resume at resume_pc with a valid stack.

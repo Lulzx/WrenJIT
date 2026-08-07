@@ -207,8 +207,10 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
         } else if (n->op == IR_GUARD_CLASS) {
             // GUARD_CLASS stores snapshot in op2 (not imm.snapshot_id)
             sid = n->op2;
-        } else if (n->op == IR_GUARD_NUM || n->op == IR_GUARD_TRUE ||
-                   n->op == IR_GUARD_FALSE || n->op == IR_GUARD_NOT_NULL) {
+        } else if (n->op == IR_GUARD_NUM || n->op == IR_GUARD_BOOL ||
+                   n->op == IR_GUARD_TRUE ||
+                   n->op == IR_GUARD_FALSE || n->op == IR_GUARD_NOT_NULL ||
+                   (n->flags & IR_FLAG_INT_GUARD)) {
             sid = n->imm.snapshot_id;
         }
         if (sid != IR_NONE && sid < buf->snapshot_count && i > last_exit_for_snap[sid])
@@ -229,6 +231,18 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
                 if (last_exit > range_end[ref])
                     range_end[ref] = last_exit;
             }
+        }
+    }
+
+    // Values used to reconstruct deferred module stores must likewise be
+    // live at every guard targeting their snapshot.
+    for (uint16_t e = 0; e < buf->exit_module_entry_count; e++) {
+        const IRExitModuleEntry* entry = &buf->exit_module_entries[e];
+        uint16_t ref = entry->ssa_ref;
+        uint16_t sid = entry->snapshot_id;
+        if (ref < buf->count && defined[ref] && sid < buf->snapshot_count &&
+            last_exit_for_snap[sid] > range_end[ref]) {
+            range_end[ref] = last_exit_for_snap[sid];
         }
     }
 

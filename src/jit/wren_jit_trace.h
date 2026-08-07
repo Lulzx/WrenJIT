@@ -35,12 +35,18 @@ typedef struct {
 
     int instr_count;
     int call_depth;
+
+    // A recognized user CALL_0 executes in the interpreter while its effect is
+    // already represented in IR. Suppress hooks from that callee frame.
+    int suppressed_frame_depth;
+
     bool aborted;
     const char* abort_reason;
 } JitRecorder;
 
 // Start recording a new trace. Called when a loop becomes hot.
-void jitRecorderStart(WrenJitState* jit, uint8_t* anchor_pc, int num_slots);
+void jitRecorderStart(WrenJitState* jit, uint8_t* anchor_pc, int num_slots,
+                      uint16_t* hot_count);
 
 // Record a single bytecode instruction. Returns true if trace completed.
 // The recorder needs the VM to inspect current state (stack values, classes, etc.).

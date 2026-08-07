@@ -62,12 +62,14 @@ typedef enum {
     IR_BOX_OBJ,          // Obj* -> Value
     IR_UNBOX_OBJ,        // Value -> Obj*
     IR_BOX_BOOL,         // native bool (0/1) -> Wren Value (FALSE_VAL or TRUE_VAL)
+    IR_BOOL_NOT,         // boxed bool -> boxed bool (requires GUARD_BOOL)
     IR_UNBOX_INT,        // NaN-tagged Value -> raw int64 (for integer IVs)
     IR_BOX_INT,          // raw int64 -> NaN-tagged Value (for integer IVs)
 
     // Guards (type checks with side exit)
     IR_GUARD_NUM,        // assert value is a number
     IR_GUARD_CLASS,      // assert value's class matches expected
+    IR_GUARD_BOOL,       // assert value is exactly false or true
     IR_GUARD_TRUE,       // assert value is truthy (not false/null)
     IR_GUARD_FALSE,      // assert value is falsy
     IR_GUARD_NOT_NULL,   // assert value is not null
@@ -128,6 +130,9 @@ typedef struct {
     #define IR_FLAG_INVARIANT 0x02   // loop-invariant (can hoist)
     #define IR_FLAG_HOISTED   0x04   // already hoisted
     #define IR_FLAG_GUARD     0x08   // is a guard instruction
+    // Integer-specialized conversion/arithmetic must side-exit if its value
+    // is not an exact Wren integer (|x| <= 2^53).
+    #define IR_FLAG_INT_GUARD 0x10
 } IRNode;
 
 // ---------------------------------------------------------------------------
@@ -136,6 +141,7 @@ typedef struct {
 #define IR_MAX_NODES 4096
 #define IR_MAX_SNAPSHOTS 256
 #define IR_MAX_SNAPSHOT_ENTRIES 64
+#define IR_MAX_EXIT_MODULE_ENTRIES 1024
 
 // ---------------------------------------------------------------------------
 // Snapshots (for deoptimisation)
@@ -146,6 +152,15 @@ typedef struct {
     uint16_t slot;      // interpreter stack slot
     uint16_t ssa_ref;   // IR SSA value that holds the current value
 } IRSnapshotEntry;
+
+// A module write deferred from the hot loop to a side exit. The referenced
+// SSA value is deliberately unboxed; the exit stub materializes the Wren
+// Value directly in module memory.
+typedef struct {
+    void* address;
+    uint16_t ssa_ref;
+    uint16_t snapshot_id;
+} IRExitModuleEntry;
 
 // A snapshot: captures interpreter state at a potential side exit.
 typedef struct {
@@ -167,6 +182,9 @@ typedef struct {
 
     IRSnapshotEntry snapshot_entries[IR_MAX_NODES]; // shared pool
     uint16_t snapshot_entry_count;
+
+    IRExitModuleEntry exit_module_entries[IR_MAX_EXIT_MODULE_ENTRIES];
+    uint16_t exit_module_entry_count;
 
     uint16_t loop_header;             // node index of IR_LOOP_HEADER
 } IRBuffer;
@@ -195,6 +213,7 @@ uint16_t irEmitStoreField(IRBuffer* buf, uint16_t obj, uint16_t field,
 uint16_t irEmitGuardNum(IRBuffer* buf, uint16_t val, uint16_t snapshot);
 uint16_t irEmitGuardClass(IRBuffer* buf, uint16_t val, void* classPtr,
                           uint16_t snapshot);
+uint16_t irEmitGuardBool(IRBuffer* buf, uint16_t val, uint16_t snapshot);
 uint16_t irEmitGuardTrue(IRBuffer* buf, uint16_t val, uint16_t snapshot);
 uint16_t irEmitGuardFalse(IRBuffer* buf, uint16_t val, uint16_t snapshot);
 

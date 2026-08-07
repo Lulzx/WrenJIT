@@ -3,6 +3,8 @@
 #include <string.h>
 #include <assert.h>
 #include "wren.h"
+#include "wren_vm.h"
+#include "wren_jit.h"
 
 static char output_buf[4096];
 static int output_len = 0;
@@ -222,8 +224,107 @@ TEST(test_nan_not_equal) {
     wrenFreeVM(vm);
 }
 
+
+TEST(test_hot_counter_saturates_and_blacklists) {
+    WrenJitState jit;
+    memset(&jit, 0, sizeof(jit));
+    jit.enabled = true;
+    jit.hot_threshold = 2;
+
+    uint16_t count = 0;
+    assert(!wrenJitIncrementHot(&jit, &count));
+    assert(wrenJitIncrementHot(&jit, &count));
+    assert(!wrenJitIncrementHot(&jit, &count));
+    assert(count == 2); // Already-hot counters are read-only.
+
+    jit.active_hot_count = &count;
+    wrenJitBlacklistCurrent(&jit);
+    assert(count == JIT_HOT_BLACKLISTED);
+    assert(!wrenJitIncrementHot(&jit, &count));
+    assert(count == JIT_HOT_BLACKLISTED);
+}
+
+TEST(test_unsupported_loop_is_blacklisted_once) {
+    // A CALL_1 on String is unsupported. Even after enough iterations to wrap
+    // a naive uint16_t counter, recording must be attempted only once.
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var hits = 0\n"
+        "var i = 0\n"
+        "while (i < 70000) {\n"
+        "  if (\"x\".contains(\"x\")) hits = hits + 1\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(hits)\n";
+    WrenInterpretResult result = wrenInterpret(vm, "main", src);
+    assert(result == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "70000") != NULL);
+    assert(vm->jit->traces_aborted == 1);
+    wrenFreeVM(vm);
+}
+
+
+TEST(test_call0_boolean_toggler_inline) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "class Box {\n"
+        "  construct new(v) { _v = v }\n"
+        "  toggle { _v = !_v }\n"
+        "  value { _v }\n"
+        "}\n"
+        "var b = Box.new(false)\n"
+        "var i = 0\n"
+        "while (i < 10000) { b.toggle i = i + 1 }\n"
+        "System.print(b.value)\n";
+    WrenInterpretResult result = wrenInterpret(vm, "main", src);
+    assert(result == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "false") != NULL);
+    assert(vm->jit->traces_compiled == 1);
+    wrenFreeVM(vm);
+}
+
+
+TEST(test_fractional_loop_values_stay_double) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var sum = 0\n"
+        "var i = 0.5\n"
+        "while (i < 1000) {\n"
+        "  sum = sum + i\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(sum)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "500000") != NULL);
+    wrenFreeVM(vm);
+}
+
+TEST(test_huge_loop_value_stays_double) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var x = 100000000000000000000\n"
+        "var i = 0\n"
+        "while (i < 1000) {\n"
+        "  x = x + 1\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(x)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "1e+20") != NULL);
+    wrenFreeVM(vm);
+}
+
 int main(void) {
     printf("=== JIT Integration Tests ===\n");
+    RUN(test_hot_counter_saturates_and_blacklists);
+    RUN(test_unsupported_loop_is_blacklisted_once);
+    RUN(test_call0_boolean_toggler_inline);
+    RUN(test_fractional_loop_values_stay_double);
+    RUN(test_huge_loop_value_stays_double);
     RUN(test_simple_sum);
     RUN(test_for_loop);
     RUN(test_nested_arithmetic);

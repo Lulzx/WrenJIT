@@ -126,15 +126,24 @@ int wrenJitExecute(WrenVM* vm, JitTrace* trace)
     return result;
 }
 
-bool wrenJitIncrementHot(WrenJitState* jit, uint8_t* bytecode,
-                          uint16_t* hot_counts, int pc_offset)
+bool wrenJitIncrementHot(WrenJitState* jit, uint16_t* hot_count)
 {
-    (void)bytecode;
+    if (jit == NULL || !jit->enabled || hot_count == NULL) return false;
 
-    if (!jit->enabled) return false;
+    // Do not keep dirtying memory for compiled/failed loops. Saturating also
+    // prevents a failed loop from wrapping around and becoming hot again.
+    if (*hot_count >= (uint16_t)jit->hot_threshold) return false;
 
-    hot_counts[pc_offset]++;
-    return hot_counts[pc_offset] == (uint16_t)jit->hot_threshold;
+    (*hot_count)++;
+    return *hot_count == (uint16_t)jit->hot_threshold;
+}
+
+void wrenJitBlacklistCurrent(WrenJitState* jit)
+{
+    if (jit != NULL && jit->active_hot_count != NULL) {
+        *jit->active_hot_count = JIT_HOT_BLACKLISTED;
+        jit->active_hot_count = NULL;
+    }
 }
 
 void wrenJitStartRecording(WrenJitState* jit, uint8_t* pc)
@@ -174,6 +183,7 @@ void wrenJitAbortRecording(WrenJitState* jit)
     jit->anchor_pc = NULL;
     jit->state = JIT_STATE_IDLE;
     jit->traces_aborted++;
+    wrenJitBlacklistCurrent(jit);
 }
 
 // Legacy API stub (recording is handled by jitRecorderStep in wren_jit_trace.c).
@@ -286,6 +296,7 @@ JitTrace* wrenJitCompileAndStore(WrenVM* vm, WrenJitState* jit,
     if (!rec) {
         fprintf(stderr, "[JIT] compile: no recorder\n");
         jit->traces_aborted++;
+        wrenJitBlacklistCurrent(jit);
         return NULL;
     }
     IRBuffer* ir = &rec->ir;
@@ -295,6 +306,7 @@ JitTrace* wrenJitCompileAndStore(WrenVM* vm, WrenJitState* jit,
     if (ir->snapshot_count == 0) {
         fprintf(stderr, "[JIT] compile: no snapshots, aborting\n");
         jit->traces_aborted++;
+        wrenJitBlacklistCurrent(jit);
         return NULL;
     }
 
@@ -325,10 +337,12 @@ JitTrace* wrenJitCompileAndStore(WrenVM* vm, WrenJitState* jit,
     if (!trace) {
         fprintf(stderr, "[JIT] compile: codegen failed\n");
         jit->traces_aborted++;
+        wrenJitBlacklistCurrent(jit);
         return NULL;
     }
 
     trace->anchor_pc = jit->anchor_pc;
+    jit->active_hot_count = NULL;
     wrenJitStoreTrace(jit, trace);
     return trace;
 }

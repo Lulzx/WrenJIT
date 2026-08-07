@@ -1,3 +1,27 @@
+diff --git a/src/vm/wren_value.c b/src/vm/wren_value.c
+index ce29e07..3345a48 100644
+--- a/src/vm/wren_value.c
++++ b/src/vm/wren_value.c
+@@ -257,6 +257,9 @@ ObjFn* wrenNewFunction(WrenVM* vm, ObjModule* module, int maxSlots)
+   fn->numUpvalues = 0;
+   fn->arity = 0;
+   fn->debug = debug;
++#ifdef WREN_JIT
++  fn->jitHotCounts = NULL;
++#endif
+   
+   return fn;
+ }
+@@ -1253,6 +1256,9 @@ void wrenFreeObj(WrenVM* vm, Obj* obj)
+       ObjFn* fn = (ObjFn*)obj;
+       wrenValueBufferClear(vm, &fn->constants);
+       wrenByteBufferClear(vm, &fn->code);
++#ifdef WREN_JIT
++      DEALLOCATE(vm, fn->jitHotCounts);
++#endif
+       wrenIntBufferClear(vm, &fn->debug->sourceLines);
+       DEALLOCATE(vm, fn->debug->name);
+       DEALLOCATE(vm, fn->debug);
 diff --git a/src/vm/wren_value.h b/src/vm/wren_value.h
 index 2ca0cfd..001f794 100644
 --- a/src/vm/wren_value.h
@@ -16,7 +40,7 @@ index 2ca0cfd..001f794 100644
  
  // An instance of a first-class function and the environment it has closed over.
 diff --git a/src/vm/wren_vm.c b/src/vm/wren_vm.c
-index f63ab8c..d3cfc69 100644
+index f63ab8c..2acf2f7 100644
 --- a/src/vm/wren_vm.c
 +++ b/src/vm/wren_vm.c
 @@ -16,6 +16,11 @@
@@ -103,7 +127,7 @@ index f63ab8c..d3cfc69 100644
          switch (instruction = (Code)READ_BYTE())
  
    #define CASE_CODE(name)  case CODE_##name
-@@ -1158,6 +1200,50 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -1158,6 +1200,62 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
        // Jump back to the top of the loop.
        uint16_t offset = READ_SHORT();
        ip -= offset;
@@ -135,16 +159,28 @@ index f63ab8c..d3cfc69 100644
 +          DISPATCH();
 +        }
 +
-+        // 3. Not recording and no trace: increment hot counter.
++        // 3. Not recording and no trace: increment this function's counter.
++        // Allocate lazily so functions which never loop pay no storage cost.
 +        {
 +          int pcOffset = (int)(ip - fn->code.data);
-+          if (wrenJitIncrementHot(vm->jit, fn->code.data,
-+                                   vm->jitHotCounts, pcOffset))
++          if (fn->jitHotCounts == NULL)
 +          {
-+            // Loop just became hot - start recording.
++            STORE_FRAME();
++            fn->jitHotCounts = ALLOCATE_ARRAY(vm, uint16_t, fn->code.count);
++            memset(fn->jitHotCounts, 0,
++                   sizeof(uint16_t) * (size_t)fn->code.count);
++            LOAD_FRAME();
++          }
++
++          uint16_t* hotCount = &fn->jitHotCounts[pcOffset];
++          if (*hotCount != JIT_HOT_BLACKLISTED &&
++              wrenJitIncrementHot(vm->jit, hotCount))
++          {
++            // Loop just became hot - start recording. The recorder retains the
++            // counter pointer so an unsupported/failed trace can blacklist it.
 +            STORE_FRAME();
 +            jitRecorderStart(vm->jit, ip,
-+                              (int)(fiber->stackTop - stackStart));
++                              (int)(fiber->stackTop - stackStart), hotCount);
 +            LOAD_FRAME();
 +          }
 +        }
@@ -155,7 +191,7 @@ index f63ab8c..d3cfc69 100644
      }
  
 diff --git a/src/vm/wren_vm.h b/src/vm/wren_vm.h
-index 7ab74c9..e5ada59 100644
+index 7ab74c9..606efaa 100644
 --- a/src/vm/wren_vm.h
 +++ b/src/vm/wren_vm.h
 @@ -6,6 +6,10 @@
@@ -169,7 +205,7 @@ index 7ab74c9..e5ada59 100644
  // The maximum number of temporary objects that can be made visible to the GC
  // at one time.
  #define WREN_MAX_TEMP_ROOTS 8
-@@ -100,7 +104,16 @@ struct WrenVM
+@@ -100,7 +104,13 @@ struct WrenVM
    Value* apiStack;
  
    WrenConfiguration config;
@@ -179,9 +215,6 @@ index 7ab74c9..e5ada59 100644
 +  // JIT compiler state. NULL if JIT is not initialized.
 +  WrenJitState* jit;
 +
-+  // Per-loop hotness counters indexed by hash(fn, pcOffset).
-+  // Using a flat array in the VM avoids per-function allocation.
-+  uint16_t jitHotCounts[65536];
 +#endif
 +
    // Compiler and debugger data:

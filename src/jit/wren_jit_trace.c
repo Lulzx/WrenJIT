@@ -95,14 +95,19 @@ static IROp numUnaryToIROp(WrenVM* vm, int symbol)
 // jitRecorderStart
 // -------------------------------------------------------------------------
 
-void jitRecorderStart(WrenJitState* jit, uint8_t* anchor_pc, int num_slots)
+void jitRecorderStart(WrenJitState* jit, uint8_t* anchor_pc, int num_slots,
+                      uint16_t* hot_count)
 {
     if (jit == NULL) return;
+    jit->active_hot_count = hot_count;
 
     // Allocate recorder on first use.
     if (jit->recorder == NULL) {
         jit->recorder = calloc(1, sizeof(JitRecorder));
-        if (jit->recorder == NULL) return;
+        if (jit->recorder == NULL) {
+            wrenJitBlacklistCurrent(jit);
+            return;
+        }
     }
 
     JitRecorder* r = (JitRecorder*)jit->recorder;
@@ -158,6 +163,7 @@ void jitRecorderAbort(WrenJitState* jit, const char* reason)
 
     jit->state = JIT_STATE_IDLE;
     jit->traces_aborted++;
+    wrenJitBlacklistCurrent(jit);
 }
 
 // -------------------------------------------------------------------------
@@ -182,6 +188,16 @@ bool jitRecorderStep(WrenJitState* jit, WrenVM* vm, uint8_t* ip)
 
     JitRecorder* r = (JitRecorder*)jit->recorder;
     if (r->aborted) return false;
+
+    // A recognized user-method call has already been represented in IR. The
+    // interpreter must still execute it during recording, but its frame uses a
+    // different stackStart. Ignore every hook in that callee and resume only
+    // after RETURN restores the caller frame.
+    if (r->suppressed_frame_depth != 0) {
+        int depth = vm->fiber->numFrames;
+        if (depth > r->suppressed_frame_depth) return false;
+        r->suppressed_frame_depth = 0;
+    }
 
     // Abort if we've recorded too many instructions.
     r->instr_count++;
