@@ -4,6 +4,15 @@ project(wrenjit C)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# Whole-program optimization significantly reduces interpreter dispatch and
+# primitive-call overhead in recursive workloads. Enable it for Release builds
+# when the selected compiler/linker support IPO/LTO.
+include(CheckIPOSupported)
+check_ipo_supported(RESULT WREN_IPO_SUPPORTED OUTPUT WREN_IPO_ERROR)
+if(WREN_IPO_SUPPORTED)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+endif()
+
 option(WREN_JIT "Enable tracing JIT compiler" ON)
 
 # ---------- Wren VM sources ----------
