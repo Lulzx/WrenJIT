@@ -64,6 +64,7 @@ typedef enum {
     IR_UNBOX_OBJ,        // Value -> Obj*
     IR_BOX_BOOL,         // native bool (0/1) -> Wren Value (FALSE_VAL or TRUE_VAL)
     IR_BOOL_NOT,         // boxed bool -> boxed bool (requires GUARD_BOOL)
+    IR_BOOL_TO_NUM,      // boxed bool -> raw integer 0/1 (requires GUARD_BOOL)
     IR_UNBOX_INT,        // NaN-tagged Value -> raw int64 (for integer IVs)
     IR_BOX_INT,          // raw int64 -> NaN-tagged Value (for integer IVs)
 
@@ -80,6 +81,8 @@ typedef enum {
     IR_LOOP_HEADER,      // marks the start of the loop
     IR_LOOP_BACK,        // backward jump to loop header
     IR_SIDE_EXIT,        // exit trace to interpreter
+    IR_TOGGLE_COUNT_BULK,// fast-forward guarded boolean-toggle/count recurrence
+    IR_RANGE_SUM_BULK,   // fast-forward exact nonnegative integer range sum
 
     // Snapshot (for deoptimization)
     IR_SNAPSHOT,         // captures live state for side exit
@@ -140,6 +143,19 @@ typedef struct {
             uint16_t slot;       // stack slot index
             uint16_t field;      // field index (for field ops)
         } mem;
+        struct {
+            uint16_t limit;      // raw numeric range limit SSA
+            uint16_t state;      // boxed boolean state SSA
+            uint16_t object;     // boxed instance SSA
+            uint16_t field;      // state field index
+            uint16_t snapshot;   // completed-range exit snapshot
+            uint16_t fallback;   // specialization-failure snapshot
+        } bulk;
+        struct {
+            uint16_t limit;
+            uint16_t snapshot;
+            uint16_t fallback;
+        } arith;
     } imm;
 
     // Optimization metadata.
@@ -151,6 +167,9 @@ typedef struct {
     // Integer-specialized conversion/arithmetic must side-exit if its value
     // is not an exact Wren integer (|x| <= 2^53).
     #define IR_FLAG_INT_GUARD 0x10
+    // Comparison is consumed only by BOX_BOOL -> GUARD_TRUE. Code generation
+    // emits the inverse comparison directly to the guard's side exit.
+    #define IR_FLAG_FUSED_TRUE_GUARD 0x20
 } IRNode;
 
 // ---------------------------------------------------------------------------

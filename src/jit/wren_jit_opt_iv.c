@@ -106,8 +106,13 @@ void irOptIVTypeInference(IRBuffer* buf)
             // A generic NUM has no proof that its runtime value is integral.
             // Promoted module variables arrive as UNBOX_NUM, so keep them on
             // the FP path rather than truncating fractions or huge doubles.
-            if (!isIntegerConstNum(preNode) &&
-                preNode->type != IR_TYPE_INT) continue;
+            bool boolStep = backNode->op == IR_ADD &&
+                ((backNode->op1 == i && backNode->op2 < buf->count &&
+                  buf->nodes[backNode->op2].op == IR_BOOL_TO_NUM) ||
+                 (backNode->op2 == i && backNode->op1 < buf->count &&
+                  buf->nodes[backNode->op1].op == IR_BOOL_TO_NUM));
+            if (!isIntegerConstNum(preNode) && preNode->type != IR_TYPE_INT &&
+                !(boolStep && preNode->op == IR_UNBOX_NUM)) continue;
 
             // Back-edge must be ADD or SUB of (phi, const/int) or (const/int, phi).
             bool backIsIV = false;

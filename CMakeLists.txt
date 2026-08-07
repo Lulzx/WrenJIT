@@ -52,6 +52,7 @@ if(WREN_JIT)
         ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_opt_iv.c
         ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_regalloc.c
         ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_codegen.c
+        ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_recursion.c
         ${CMAKE_SOURCE_DIR}/src/jit/wren_jit_memory.c
         ${SLJIT_DIR}/sljit_src/sljitLir.c
     )

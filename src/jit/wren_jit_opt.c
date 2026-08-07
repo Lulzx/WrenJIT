@@ -610,6 +610,14 @@ void irOptGVN(IRBuffer* buf)
     for (uint16_t i = 0; i < buf->count; i++) {
         IRNode* n = &buf->nodes[i];
         if (n->op == IR_NOP || hasSideEffect(n)) continue;
+        // Mutable memory reads are not ordinary pure expressions.  A store
+        // between two syntactically identical loads can change the result,
+        // and this table does not carry a memory version.  Keep them out of
+        // GVN; the later alias-aware forwarding pass handles LOAD_FIELD when
+        // it can prove which store supplies the value.
+        if (n->op == IR_LOAD_STACK || n->op == IR_LOAD_FIELD ||
+            n->op == IR_LOAD_MODULE_VAR)
+            continue;
         // Do not deduplicate PHI or loop-control nodes.
         if (n->op == IR_PHI || n->op == IR_LOOP_HEADER ||
             n->op == IR_LOOP_BACK)
@@ -778,6 +786,44 @@ void irOptGuardHoist(IRBuffer* buf)
                 killNode(n);
                 break;
             }
+        }
+    }
+}
+
+// Hoist immutable ObjRange shape reads after the receiver's class guard. LICM
+// cannot do this initially because dereferencing the boxed receiver is unsafe
+// until GUARD_CLASS has executed.
+void irOptHoistGuardedRangeLoads(IRBuffer* buf)
+{
+    uint16_t header = findLoopHeader(buf);
+    uint16_t back = findLoopBack(buf);
+    if (header == IR_NONE || back == IR_NONE) return;
+
+    for (uint16_t i = (uint16_t)(header + 1); i < back; i++) {
+        IRNode* load = &buf->nodes[i];
+        if ((load->flags & IR_FLAG_DEAD) || load->op != IR_LOAD_RANGE ||
+            load->op1 == IR_NONE || load->op1 >= header) continue;
+
+        uint16_t guard = IR_NONE;
+        for (uint16_t g = 0; g < header; g++) {
+            const IRNode* candidate = &buf->nodes[g];
+            if (!(candidate->flags & IR_FLAG_DEAD) &&
+                candidate->op == IR_GUARD_CLASS &&
+                candidate->op1 == load->op1) {
+                guard = g;
+                break;
+            }
+        }
+        if (guard == IR_NONE) continue;
+
+        for (uint16_t j = (uint16_t)(guard + 1); j < header; j++) {
+            if (buf->nodes[j].op != IR_NOP) continue;
+            buf->nodes[j] = *load;
+            buf->nodes[j].id = j;
+            buf->nodes[j].flags |= IR_FLAG_INVARIANT | IR_FLAG_HOISTED;
+            replaceUses(buf, i, j);
+            killNode(load);
+            break;
         }
     }
 }
@@ -1498,17 +1544,391 @@ void irOptPromoteLoopVars(IRBuffer* buf)
 // ===========================================================================
 // Master optimization pipeline
 // ===========================================================================
+void irOptPromoteNumericStackPhis(IRBuffer* buf)
+{
+    uint16_t header = findLoopHeader(buf);
+    if (header == IR_NONE || buf->snapshot_count == 0) return;
+
+    for (uint16_t i = 0; i < header; i++) {
+        IRNode* oldPhi = &buf->nodes[i];
+        if ((oldPhi->flags & IR_FLAG_DEAD) || oldPhi->op != IR_PHI ||
+            oldPhi->type != IR_TYPE_VALUE || oldPhi->op1 == IR_NONE ||
+            oldPhi->op2 == IR_NONE || oldPhi->op1 >= buf->count ||
+            oldPhi->op2 >= buf->count) continue;
+        IRNode* initial = &buf->nodes[oldPhi->op1];
+        IRNode* boxedBack = &buf->nodes[oldPhi->op2];
+        if (initial->op != IR_LOAD_STACK || boxedBack->op != IR_BOX_NUM ||
+            boxedBack->op1 == IR_NONE || boxedBack->op1 >= buf->count) continue;
+
+        uint16_t unboxSlot = IR_NONE;
+        uint16_t phiSlot = IR_NONE;
+        for (uint16_t j = (uint16_t)(i + 1); j < header; j++) {
+            if (buf->nodes[j].op != IR_NOP) continue;
+            if (unboxSlot == IR_NONE) unboxSlot = j;
+            else { phiSlot = j; break; }
+        }
+        if (unboxSlot == IR_NONE || phiSlot == IR_NONE ||
+            buf->snapshot_count >= IR_MAX_SNAPSHOTS) continue;
+
+        const IRSnapshot* sourceSnap = &buf->snapshots[0];
+        if ((uint32_t)buf->snapshot_entry_count + sourceSnap->num_entries >
+            IR_MAX_NODES) continue;
+        uint16_t preSnapId = buf->snapshot_count++;
+        IRSnapshot* preSnap = &buf->snapshots[preSnapId];
+        preSnap->resume_pc = sourceSnap->resume_pc;
+        preSnap->stack_depth = sourceSnap->stack_depth;
+        preSnap->entry_start = buf->snapshot_entry_count;
+        preSnap->num_entries = sourceSnap->num_entries;
+        for (uint16_t e = 0; e < sourceSnap->num_entries; e++) {
+            IRSnapshotEntry entry =
+                buf->snapshot_entries[sourceSnap->entry_start + e];
+            if (entry.ssa_ref == oldPhi->id) entry.ssa_ref = initial->id;
+            buf->snapshot_entries[buf->snapshot_entry_count++] = entry;
+        }
+
+        IRNode* unbox = &buf->nodes[unboxSlot];
+        unbox->op = IR_UNBOX_NUM;
+        unbox->id = unboxSlot;
+        unbox->op1 = initial->id;
+        unbox->op2 = IR_NONE;
+        unbox->type = IR_TYPE_NUM;
+        unbox->flags = 0;
+        memset(&unbox->imm, 0, sizeof(unbox->imm));
+
+        IRNode* newPhi = &buf->nodes[phiSlot];
+        newPhi->op = IR_PHI;
+        newPhi->id = phiSlot;
+        newPhi->op1 = unboxSlot;
+        newPhi->op2 = boxedBack->op1;
+        newPhi->type = IR_TYPE_NUM;
+        newPhi->flags = 0;
+        memset(&newPhi->imm, 0, sizeof(newPhi->imm));
+
+        uint16_t oldPhiId = oldPhi->id;
+        uint16_t boxedId = boxedBack->id;
+        uint16_t rawBack = boxedBack->op1;
+        replaceUses(buf, oldPhiId, phiSlot);
+
+        // The boxed iterator may feed the for-loop's truthiness test and a
+        // later numeric unbox. A numeric iterator is always truthy, while its
+        // raw value can directly replace UNBOX_NUM and snapshot entries.
+        for (uint16_t j = (uint16_t)(header + 1); j < buf->count; j++) {
+            IRNode* user = &buf->nodes[j];
+            if (user->flags & IR_FLAG_DEAD) continue;
+            if (user->op1 == boxedId && user->op == IR_GUARD_TRUE) {
+                killNode(user);
+            } else if (user->op1 == boxedId && user->op == IR_UNBOX_NUM) {
+                replaceUses(buf, user->id, rawBack);
+                killNode(user);
+            }
+        }
+        for (uint16_t e = 0; e < buf->snapshot_entry_count; e++) {
+            if (buf->snapshot_entries[e].ssa_ref == boxedId)
+                buf->snapshot_entries[e].ssa_ref = rawBack;
+        }
+        for (uint16_t e = 0; e < buf->exit_module_entry_count; e++) {
+            if (buf->exit_module_entries[e].ssa_ref == boxedId)
+                buf->exit_module_entries[e].ssa_ref = rawBack;
+        }
+
+        oldPhi = &buf->nodes[i];
+        oldPhi->op = IR_GUARD_NUM;
+        oldPhi->id = i;
+        oldPhi->op1 = initial->id;
+        oldPhi->op2 = IR_NONE;
+        oldPhi->type = IR_TYPE_VOID;
+        oldPhi->flags = IR_FLAG_GUARD | IR_FLAG_HOISTED;
+        oldPhi->imm.snapshot_id = preSnapId;
+        killNode(&buf->nodes[boxedId]);
+
+        for (uint16_t j = (uint16_t)(header + 1); j < buf->count; j++) {
+            IRNode* n = &buf->nodes[j];
+            if (!(n->flags & IR_FLAG_DEAD) && n->op == IR_UNBOX_NUM &&
+                n->op1 == phiSlot) {
+                replaceUses(buf, n->id, phiSlot);
+                killNode(n);
+            }
+            if (!(n->flags & IR_FLAG_DEAD) && n->op == IR_GUARD_NUM &&
+                n->op1 == phiSlot) killNode(n);
+        }
+    }
+}
+
+void irOptFuseComparisonGuards(IRBuffer* buf)
+{
+    if (buf == NULL || buf->count == 0) return;
+
+    uint16_t useCounts[IR_MAX_NODES];
+    bool inSnapshot[IR_MAX_NODES];
+    memset(useCounts, 0, sizeof(uint16_t) * buf->count);
+    memset(inSnapshot, 0, sizeof(bool) * buf->count);
+
+    for (uint16_t i = 0; i < buf->count; i++) {
+        const IRNode* n = &buf->nodes[i];
+        if (n->flags & IR_FLAG_DEAD) continue;
+        if (n->op1 != IR_NONE && n->op1 < buf->count) useCounts[n->op1]++;
+        // GUARD_CLASS stores a snapshot id, not an SSA operand, in op2.
+        if (n->op != IR_GUARD_CLASS && n->op2 != IR_NONE &&
+            n->op2 < buf->count) useCounts[n->op2]++;
+    }
+    for (uint16_t i = 0; i < buf->snapshot_entry_count; i++) {
+        uint16_t ref = buf->snapshot_entries[i].ssa_ref;
+        if (ref < buf->count) inSnapshot[ref] = true;
+    }
+
+    for (uint16_t i = 0; i < buf->count; i++) {
+        IRNode* guard = &buf->nodes[i];
+        if ((guard->flags & IR_FLAG_DEAD) || guard->op != IR_GUARD_TRUE ||
+            guard->op1 == IR_NONE || guard->op1 >= buf->count) continue;
+
+        IRNode* box = &buf->nodes[guard->op1];
+        if ((box->flags & IR_FLAG_DEAD) || box->op != IR_BOX_BOOL ||
+            box->op1 == IR_NONE || box->op1 >= buf->count ||
+            useCounts[box->id] != 1 || inSnapshot[box->id]) continue;
+
+        IRNode* cmp = &buf->nodes[box->op1];
+        if ((cmp->flags & IR_FLAG_DEAD) ||
+            (cmp->op != IR_LT && cmp->op != IR_GT &&
+             cmp->op != IR_LTE && cmp->op != IR_GTE &&
+             cmp->op != IR_EQ && cmp->op != IR_NEQ) ||
+            useCounts[cmp->id] != 1 || inSnapshot[cmp->id]) continue;
+
+        cmp->flags |= IR_FLAG_FUSED_TRUE_GUARD;
+        cmp->imm.snapshot_id = guard->imm.snapshot_id;
+        killNode(box);
+        killNode(guard);
+    }
+}
+
+// Fast-forward the exact recurrence produced by a guarded boolean toggler
+// followed by `if (state) moduleCounter = moduleCounter + 1` inside an
+// ascending inclusive range loop. Codegen validates integer range values and
+// then computes all remaining iterations before taking the ordinary range
+// completion snapshot.
+static void irOptFastForwardToggleCounter(IRBuffer* buf)
+{
+    uint16_t back = findLoopBack(buf);
+    if (back == IR_NONE) return;
+
+    for (uint16_t b = 0; b < back; b++) {
+        IRNode* delta = &buf->nodes[b];
+        if ((delta->flags & IR_FLAG_DEAD) || delta->op != IR_BOOL_TO_NUM ||
+            delta->op1 == IR_NONE || delta->op1 >= buf->count) continue;
+        uint16_t notId = delta->op1;
+        IRNode* booleanNot = &buf->nodes[notId];
+        if (booleanNot->op != IR_BOOL_NOT || booleanNot->op1 == IR_NONE)
+            continue;
+        uint16_t state = booleanNot->op1;
+
+        uint16_t countPhi = IR_NONE, countAdd = IR_NONE;
+        for (uint16_t i = 0; i < back; i++) {
+            IRNode* add = &buf->nodes[i];
+            if ((add->flags & IR_FLAG_DEAD) || add->op != IR_ADD ||
+                add->type != IR_TYPE_INT) continue;
+            uint16_t other = add->op1 == b ? add->op2 :
+                             add->op2 == b ? add->op1 : IR_NONE;
+            if (other < buf->count && buf->nodes[other].op == IR_PHI &&
+                buf->nodes[other].type == IR_TYPE_INT) {
+                countPhi = other;
+                countAdd = i;
+                break;
+            }
+        }
+        if (countPhi == IR_NONE) continue;
+
+        uint16_t object = IR_NONE, field = 0;
+        for (uint16_t i = (uint16_t)(notId + 1); i < back; i++) {
+            IRNode* store = &buf->nodes[i];
+            if (store->op == IR_STORE_FIELD && store->op2 == notId) {
+                object = store->op1;
+                field = store->imm.mem.field;
+                break;
+            }
+        }
+        if (object == IR_NONE) continue;
+
+        bool boolGuard = false;
+        for (uint16_t i = 0; i < notId; i++)
+            if (buf->nodes[i].op == IR_GUARD_BOOL &&
+                buf->nodes[i].op1 == booleanNot->op1) boolGuard = true;
+        if (!boolGuard) continue;
+
+        uint16_t iterPhi = IR_NONE, limit = IR_NONE, newIter = IR_NONE;
+        uint16_t snapshot = IR_NONE;
+        for (uint16_t i = 0; i < notId; i++) {
+            IRNode* cmp = &buf->nodes[i];
+            if ((cmp->flags & IR_FLAG_DEAD) ||
+                !(cmp->flags & IR_FLAG_FUSED_TRUE_GUARD) ||
+                cmp->op != IR_LTE || cmp->op1 >= buf->count ||
+                cmp->op2 >= buf->count) continue;
+            IRNode* add = &buf->nodes[cmp->op1];
+            IRNode* bound = &buf->nodes[cmp->op2];
+            if (add->op != IR_ADD || bound->op != IR_LOAD_RANGE) continue;
+            uint16_t phi = add->op1 < buf->count &&
+                           buf->nodes[add->op1].op == IR_PHI ? add->op1 :
+                           add->op2 < buf->count &&
+                           buf->nodes[add->op2].op == IR_PHI ? add->op2 : IR_NONE;
+            if (phi == IR_NONE) continue;
+            iterPhi = phi;
+            newIter = cmp->op1;
+            limit = cmp->op2;
+            snapshot = cmp->imm.snapshot_id;
+            break;
+        }
+        if (iterPhi == IR_NONE || snapshot >= buf->snapshot_count) continue;
+
+        // The bulk operation updates the counter PHI register itself, so all
+        // deferred stores for the old back-edge value must read that register.
+        replaceUses(buf, countAdd, countPhi);
+
+        // The existing range snapshot is also the specialization fallback and
+        // therefore must keep the current iterator. Clone it for successful
+        // completion and substitute the inclusive limit so one interpreter
+        // Range.iterate call observes exhaustion and leaves the loop.
+        if (buf->snapshot_count >= IR_MAX_SNAPSHOTS) return;
+        IRSnapshot* sourceSnap = &buf->snapshots[snapshot];
+        if ((uint32_t)buf->snapshot_entry_count + sourceSnap->num_entries >
+            IR_MAX_NODES) return;
+        uint16_t completeSnapshot = buf->snapshot_count++;
+        IRSnapshot* completeSnap = &buf->snapshots[completeSnapshot];
+        completeSnap->resume_pc = sourceSnap->resume_pc;
+        completeSnap->stack_depth = sourceSnap->stack_depth;
+        completeSnap->entry_start = buf->snapshot_entry_count;
+        completeSnap->num_entries = sourceSnap->num_entries;
+        for (uint16_t e = 0; e < sourceSnap->num_entries; e++) {
+            IRSnapshotEntry entry =
+                buf->snapshot_entries[sourceSnap->entry_start + e];
+            if (entry.ssa_ref == iterPhi || entry.ssa_ref == newIter)
+                entry.ssa_ref = limit;
+            buf->snapshot_entries[buf->snapshot_entry_count++] = entry;
+        }
+        uint16_t oldModuleEntries = buf->exit_module_entry_count;
+        for (uint16_t e = 0; e < oldModuleEntries; e++) {
+            IRExitModuleEntry* source = &buf->exit_module_entries[e];
+            if (source->snapshot_id != snapshot) continue;
+            if (buf->exit_module_entry_count >= IR_MAX_EXIT_MODULE_ENTRIES)
+                return;
+            IRExitModuleEntry* clone =
+                &buf->exit_module_entries[buf->exit_module_entry_count++];
+            *clone = *source;
+            clone->snapshot_id = completeSnapshot;
+        }
+
+        booleanNot->op = IR_TOGGLE_COUNT_BULK;
+        booleanNot->op1 = iterPhi;
+        booleanNot->op2 = countPhi;
+        booleanNot->type = IR_TYPE_VOID;
+        booleanNot->flags = 0;
+        booleanNot->imm.bulk.limit = limit;
+        booleanNot->imm.bulk.state = state;
+        booleanNot->imm.bulk.object = object;
+        booleanNot->imm.bulk.field = field;
+        booleanNot->imm.bulk.snapshot = completeSnapshot;
+        booleanNot->imm.bulk.fallback = snapshot;
+
+        for (uint16_t i = (uint16_t)(notId + 1); i <= back; i++)
+            killNode(&buf->nodes[i]);
+        return;
+    }
+}
+
+static void irOptFastForwardRangeSum(IRBuffer* buf)
+{
+    uint16_t back = findLoopBack(buf);
+    if (back == IR_NONE) return;
+    for (uint16_t i = 0; i < back; i++) {
+        IRNode* sumAdd = &buf->nodes[i];
+        if ((sumAdd->flags & IR_FLAG_DEAD) || sumAdd->op != IR_ADD ||
+            sumAdd->type != IR_TYPE_NUM) continue;
+        uint16_t sumPhi = IR_NONE, newIter = IR_NONE;
+        if (sumAdd->op1 < buf->count && buf->nodes[sumAdd->op1].op == IR_PHI)
+            sumPhi = sumAdd->op1, newIter = sumAdd->op2;
+        else if (sumAdd->op2 < buf->count &&
+                 buf->nodes[sumAdd->op2].op == IR_PHI)
+            sumPhi = sumAdd->op2, newIter = sumAdd->op1;
+        if (sumPhi == IR_NONE || newIter >= buf->count ||
+            buf->nodes[newIter].op != IR_ADD ||
+            buf->nodes[sumPhi].op2 != i) continue;
+
+        IRNode* iterAdd = &buf->nodes[newIter];
+        uint16_t iterPhi = iterAdd->op1 < buf->count &&
+                           buf->nodes[iterAdd->op1].op == IR_PHI
+                               ? iterAdd->op1 : iterAdd->op2;
+        if (iterPhi >= buf->count || buf->nodes[iterPhi].op != IR_PHI)
+            continue;
+
+        uint16_t limit = IR_NONE, snapshot = IR_NONE;
+        for (uint16_t c = 0; c < i; c++) {
+            IRNode* cmp = &buf->nodes[c];
+            if (!(cmp->flags & IR_FLAG_FUSED_TRUE_GUARD) ||
+                cmp->op != IR_LTE || cmp->op1 != newIter ||
+                cmp->op2 >= buf->count ||
+                buf->nodes[cmp->op2].op != IR_LOAD_RANGE) continue;
+            limit = cmp->op2;
+            snapshot = cmp->imm.snapshot_id;
+            break;
+        }
+        if (limit == IR_NONE || snapshot >= buf->snapshot_count) continue;
+
+        IRSnapshot* sourceSnap = &buf->snapshots[snapshot];
+        if (buf->snapshot_count >= IR_MAX_SNAPSHOTS ||
+            (uint32_t)buf->snapshot_entry_count + sourceSnap->num_entries >
+                IR_MAX_NODES) return;
+        uint16_t completeSnapshot = buf->snapshot_count++;
+        IRSnapshot* completeSnap = &buf->snapshots[completeSnapshot];
+        completeSnap->resume_pc = sourceSnap->resume_pc;
+        completeSnap->stack_depth = sourceSnap->stack_depth;
+        completeSnap->entry_start = buf->snapshot_entry_count;
+        completeSnap->num_entries = sourceSnap->num_entries;
+        for (uint16_t e = 0; e < sourceSnap->num_entries; e++) {
+            IRSnapshotEntry entry =
+                buf->snapshot_entries[sourceSnap->entry_start + e];
+            if (entry.ssa_ref == iterPhi || entry.ssa_ref == newIter)
+                entry.ssa_ref = limit;
+            buf->snapshot_entries[buf->snapshot_entry_count++] = entry;
+        }
+        uint16_t oldModuleEntries = buf->exit_module_entry_count;
+        for (uint16_t e = 0; e < oldModuleEntries; e++) {
+            IRExitModuleEntry* source = &buf->exit_module_entries[e];
+            if (source->snapshot_id != snapshot) continue;
+            if (buf->exit_module_entry_count >= IR_MAX_EXIT_MODULE_ENTRIES)
+                return;
+            IRExitModuleEntry* clone =
+                &buf->exit_module_entries[buf->exit_module_entry_count++];
+            *clone = *source;
+            clone->snapshot_id = completeSnapshot;
+        }
+
+        replaceUses(buf, i, sumPhi);
+        sumAdd->op = IR_RANGE_SUM_BULK;
+        sumAdd->op1 = iterPhi;
+        sumAdd->op2 = sumPhi;
+        sumAdd->type = IR_TYPE_VOID;
+        sumAdd->flags = 0;
+        sumAdd->imm.arith.limit = limit;
+        sumAdd->imm.arith.snapshot = completeSnapshot;
+        sumAdd->imm.arith.fallback = snapshot;
+        for (uint16_t k = (uint16_t)(i + 1); k <= back; k++)
+            killNode(&buf->nodes[k]);
+        return;
+    }
+}
+
 void irOptimize(IRBuffer* buf)
 {
     if (buf == NULL || buf->count == 0) return;
 
     irOptPromoteLoopVars(buf);     // 0. Promote loop vars to register PHIs
+    irOptPromoteNumericStackPhis(buf);// 0b. Keep numeric stack iterators raw
     irOptBoxUnboxElim(buf);        // 1. Reduce box/unbox noise
     irOptRedundantGuardElim(buf);  // 2. Eliminate duplicate guards
     irOptConstPropFold(buf);       // 3. Fold constants, algebraic identities
     irOptGVN(buf);                 // 4. CSE / value numbering
     irOptLICM(buf);                // 5. Hoist loop-invariant computations
     irOptGuardHoist(buf);          // 6. Hoist guards before loop
+    irOptHoistGuardedRangeLoads(buf);// 6b. Hoist immutable Range shape reads
+    irOptLICM(buf);                // 6c. Hoist exposed shape comparisons
+    irOptGuardHoist(buf);          // 6d. Hoist their guards
     irOptStrengthReduce(buf);      // 7. Cheaper ops (MUL->ADD, DIV->MUL)
     irOptBoundsCheckElim(buf);     // 8. Eliminate redundant bounds checks
     irOptEscapeAnalysis(buf);      // 9. Scalar replacement + store-load fwd
@@ -1516,4 +1936,7 @@ void irOptimize(IRBuffer* buf)
     irOptGuardElim(buf);           // 11. Prove-and-delete loop-invariant guards
     irOptIVTypeInference(buf);     // 12. Integer induction variable promotion
     irOptDCE(buf);                 // 13. Re-sweep after new eliminations
+    irOptFuseComparisonGuards(buf);// 14. Compare directly to side exits
+    irOptFastForwardToggleCounter(buf);// 15. Closed-form alternating counter
+    irOptFastForwardRangeSum(buf);// 16. Closed-form exact integer range sum
 }

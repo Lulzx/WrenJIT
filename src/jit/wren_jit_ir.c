@@ -269,6 +269,7 @@ const char* irOpName(IROp op)
     case IR_UNBOX_OBJ:      return "UNBOX_OBJ";
     case IR_BOX_BOOL:       return "BOX_BOOL";
     case IR_BOOL_NOT:       return "BOOL_NOT";
+    case IR_BOOL_TO_NUM:    return "BOOL_TO_NUM";
     case IR_UNBOX_INT:      return "UNBOX_INT";
     case IR_BOX_INT:        return "BOX_INT";
     case IR_GUARD_NUM:      return "GUARD_NUM";
@@ -281,6 +282,8 @@ const char* irOpName(IROp op)
     case IR_LOOP_HEADER:    return "LOOP_HEADER";
     case IR_LOOP_BACK:      return "LOOP_BACK";
     case IR_SIDE_EXIT:      return "SIDE_EXIT";
+    case IR_TOGGLE_COUNT_BULK: return "TOGGLE_COUNT_BULK";
+    case IR_RANGE_SUM_BULK: return "RANGE_SUM_BULK";
     case IR_SNAPSHOT:       return "SNAPSHOT";
     case IR_CALL_C:         return "CALL_C";
     case IR_CALL_WREN:      return "CALL_WREN";

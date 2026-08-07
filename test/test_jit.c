@@ -322,6 +322,28 @@ TEST(test_call0_toggler_returning_this_inline) {
     wrenFreeVM(vm);
 }
 
+TEST(test_toggle_counter_fast_forward_odd) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "class Toggle {\n"
+        "  construct new(v) { _v = v }\n"
+        "  value { _v }\n"
+        "  activate { _v = !_v return this }\n"
+        "}\n"
+        "var t = Toggle.new(false)\n"
+        "var count = 0\n"
+        "for (i in 1..10001) {\n"
+        "  if (t.activate.value) count = count + 1\n"
+        "}\n"
+        "System.print(count)\n"
+        "System.print(t.value)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "5001\ntrue") != NULL);
+    assert(vm->jit->traces_compiled == 1);
+    wrenFreeVM(vm);
+}
+
 TEST(test_fractional_loop_values_stay_double) {
     resetOutput();
     WrenVM* vm = createVM();
@@ -423,17 +445,61 @@ TEST(test_huge_loop_value_stays_double) {
     wrenFreeVM(vm);
 }
 
+TEST(test_recursive_numeric_kernel) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "class Fib {\n"
+        "  static compute(n) {\n"
+        "    if (n < 2) return n\n"
+        "    return Fib.compute(n - 1) + Fib.compute(n - 2)\n"
+        "  }\n"
+        "}\n"
+        "System.print(Fib.compute(20))\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "6765") != NULL);
+    assert(vm->jit->traces_compiled == 1);
+    wrenFreeVM(vm);
+}
+
+TEST(test_recursive_tree_kernels) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "class Node {\n"
+        "  construct new(left, right) { _left = left _right = right }\n"
+        "  check {\n"
+        "    if (_left == null) return 1\n"
+        "    return 1 + _left.check + _right.check\n"
+        "  }\n"
+        "}\n"
+        "class Trees {\n"
+        "  static make(depth) {\n"
+        "    if (depth == 0) return Node.new(null, null)\n"
+        "    return Node.new(Trees.make(depth - 1), Trees.make(depth - 1))\n"
+        "  }\n"
+        "}\n"
+        "System.print(Trees.make(10).check)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "2047") != NULL);
+    assert(vm->jit->traces_compiled == 2);
+    wrenFreeVM(vm);
+}
+
 int main(void) {
     printf("=== JIT Integration Tests ===\n");
     RUN(test_hot_counter_saturates_and_blacklists);
     RUN(test_unsupported_loop_is_blacklisted_once);
     RUN(test_call0_boolean_toggler_inline);
     RUN(test_call0_toggler_returning_this_inline);
+    RUN(test_toggle_counter_fast_forward_odd);
     RUN(test_fractional_loop_values_stay_double);
     RUN(test_range_trace_reused_across_shapes);
     RUN(test_range_loop_stack_promotion);
     RUN(test_integer_comparison_specialization);
     RUN(test_huge_loop_value_stays_double);
+    RUN(test_recursive_numeric_kernel);
+    RUN(test_recursive_tree_kernels);
     RUN(test_simple_sum);
     RUN(test_for_loop);
     RUN(test_nested_arithmetic);

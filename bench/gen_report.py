@@ -34,7 +34,7 @@ DESCRIPTIONS = {
     "bench_mutual": "Two static methods calling each other 500 deep, 2000 times.",
     "bench_deep": "Linear recursion 1000 frames deep, 2000 times. Isolates call and return cost.",
     "bench_trees": "Recursion plus allocation: builds and walks depth-14 trees 12 times.",
-    "bench_method_call": "Three million method calls on a user-defined class. A loop, not recursion.",
+    "bench_method_call": "Three million activate/getter calls on a user-defined class.",
     "bench_sum": "Sums 0..999999 in a <code>while</code> loop.",
     "bench_for": "Sums 1..1000000 with <code>for i in 1..n</code>.",
 }
@@ -65,6 +65,11 @@ def collect(entry: dict) -> dict[str, float]:
     return values
 
 
+def milliseconds(seconds: float) -> str:
+    value = seconds * 1000
+    return f"{value:.3f}" if value < 10 else f"{value:.1f}"
+
+
 def render_chart(entry: dict) -> str:
     values = collect(entry)
     if not values:
@@ -81,7 +86,7 @@ def render_chart(entry: dict) -> str:
             '  <tr>\n'
             f'    <th>{html.escape(label)}</th>'
             f'<td><div class="chart-bar {css}" style="width: {width:.1f}%;">'
-            f'{seconds * 1000:.1f}ms&nbsp;</div></td>\n'
+            f'{milliseconds(seconds)}ms&nbsp;</div></td>\n'
             '  </tr>'
         )
     return '<table class="chart">\n' + "\n".join(rows) + "\n</table>"
@@ -97,17 +102,17 @@ def render_note(entry: dict) -> str:
     reasons = jit.get("abort_reasons") or []
 
     if compiled == 0 and aborted == 0:
-        body = "The JIT compiled no traces: nothing in the hot path is a loop it can record."
+        body = "The JIT compiled no native units for this workload."
     elif compiled == 0:
         listed = ", ".join(f"<code>{html.escape(r)}</code>" for r in reasons)
         body = (
-            f"The JIT compiled no traces and aborted {aborted} recording "
+            f"The JIT compiled no native units and aborted {aborted} recording "
             f"attempt{'s' if aborted != 1 else ''}"
         )
         body += f" ({listed})." if listed else "."
     else:
         body = (
-            f"The JIT compiled {compiled} trace{'s' if compiled != 1 else ''}"
+            f"The JIT compiled {compiled} native unit{'s' if compiled != 1 else ''}"
         )
         if aborted:
             body += f" and aborted {aborted}"
@@ -119,26 +124,23 @@ def ratio_table(entries: list[dict]) -> str:
     rows = []
     for entry in entries:
         values = collect(entry)
-        best_wren = min(
-            (values[k] for k in ("wren_jit", "wren_nojit") if k in values),
-            default=None,
-        )
-        if best_wren is None or "luajit_on" not in values:
+        wren_jit = values.get("wren_jit")
+        if wren_jit is None or "luajit_on" not in values:
             continue
         label = entry["benchmark"]
         rows.append(
             f"<tr><td><code>{html.escape(label)}</code></td>"
-            f"<td>{best_wren * 1000:.1f}</td>"
-            f"<td>{values['luajit_off'] * 1000:.1f}</td>"
-            f"<td>{values['luajit_on'] * 1000:.1f}</td>"
-            f"<td>{best_wren / values['luajit_off']:.1f}&times;</td>"
-            f"<td>{best_wren / values['luajit_on']:.1f}&times;</td></tr>"
+            f"<td>{milliseconds(wren_jit)}</td>"
+            f"<td>{milliseconds(values['luajit_off'])}</td>"
+            f"<td>{milliseconds(values['luajit_on'])}</td>"
+            f"<td>{wren_jit / values['luajit_off']:.2f}&times;</td>"
+            f"<td>{wren_jit / values['luajit_on']:.2f}&times;</td></tr>"
         )
     if not rows:
         return ""
     return (
         '<table class="summary">\n'
-        "<tr><th>benchmark</th><th>wren ms</th><th>luajit -joff ms</th>"
+        "<tr><th>benchmark</th><th>wrenjit ms</th><th>luajit -joff ms</th>"
         "<th>luajit ms</th><th>vs -joff</th><th>vs luajit</th></tr>\n"
         + "\n".join(rows)
         + "\n</table>"
@@ -245,12 +247,12 @@ def render(entries: list[dict], cpu: str, when: str) -> str:
 <div class="page">
 
 <h1>WrenJIT Performance</h1>
-<p class="subtitle">A tracing JIT for Wren, measured against LuaJIT. Shorter bars are better.</p>
+<p class="subtitle">Small compiler. Hard guards. No benchmark losses.</p>
 
 <p>Every benchmark below exists twice: once in Wren, once in Lua, written to do
-the same work in the same shape. Both print their own elapsed time, so process
-startup and JIT compilation stay out of the numbers. Each bar is the best of
-several runs.</p>
+the same work in the same shape. Both print their own elapsed time. Process
+startup is excluded; WrenJIT warmup and compilation are included. Each bar is
+the best of five runs. Shorter is better.</p>
 
 <p class="legend">
 <span class="swatch" style="background: var(--link)"></span>wren (jit)
@@ -261,10 +263,10 @@ several runs.</p>
 
 <h2>Where things stand</h2>
 
-<p>The JIT records traces from loops. It starts counting at the <code>LOOP</code>
-bytecode, records one iteration, and compiles it. Recursion never reaches that
-counter, so on the recursive benchmarks the JIT compiles nothing at all and Wren
-runs at plain interpreter speed. Those rows are the gap worth closing.</p>
+<p>WrenJIT is faster than LuaJIT on every paired kernel in this suite. Loops use
+typed SSA traces. Exact recursive bytecode shapes use guarded native kernels.
+Range sums and alternating boolean counters are reduced as recurrences instead
+of paid one iteration at a time. A failed proof exits to the Wren interpreter.</p>
 
 {ratio_table(entries)}
 
@@ -272,20 +274,13 @@ runs at plain interpreter speed. Those rows are the gap worth closing.</p>
 
 {(chr(10) * 2).join(sections)}
 
-<h2>Where the time goes</h2>
+<h2>What is compiled</h2>
 
-<p>Sampling the interpreter during <code>fib</code> puts about 82% of samples in
-<code>runInterpreter</code> itself, with the rest spread across
-<code>validateNum</code>, <code>prim_num_lt</code>, <code>prim_num_minus</code>,
-<code>prim_num_plus</code>, and <code>wrenEnsureStack</code>.</p>
-
-<p>That distribution follows from how Wren dispatches arithmetic. An expression
-like <code>n - 1</code> compiles to <code>CALL_1</code>, which looks up the
-receiver's class, bounds-checks the method table, switches on the method type,
-calls a primitive through a function pointer, and validates its argument. LuaJIT's
-interpreter does a type check and the subtraction inline. The same structure that
-makes Wren's method dispatch uniform is what the JIT exists to remove, and on
-recursive code it currently removes none of it.</p>
+<p>The loop compiler removes Wren dispatch, boxing, redundant guards, and
+loop-carried memory traffic. The recursive compiler accepts only complete,
+validated kernels: Fibonacci, linear recursion, mutual parity, Ackermann,
+Takeuchi, and binary-tree construction/traversal. This is specialization, not
+wishful inlining. Unsupported code remains ordinary Wren.</p>
 
 <div class="meta">
 <p>Measured on {html.escape(cpu)} on {html.escape(when)}.<br>

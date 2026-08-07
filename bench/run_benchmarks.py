@@ -30,7 +30,9 @@ RECURSION_BENCHMARKS = [
     "bench_method_call",
 ]
 
-ELAPSED_RE = re.compile(r"elapsed:\s*([0-9]+(?:\.[0-9]+)?)")
+ELAPSED_RE = re.compile(
+    r"elapsed:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"
+)
 TRACE_RE = re.compile(r"Traces compiled: (\d+), aborted: (\d+), exits: (\d+)")
 ABORT_RE = re.compile(r"^\[JIT\] abort: (.+)$", re.MULTILINE)
 
@@ -109,6 +111,10 @@ def parse_args() -> argparse.Namespace:
         "--json",
         action="store_true",
         help="Emit structured JSON instead of a text table.",
+    )
+    parser.add_argument(
+        "--output",
+        help="Write output to this file instead of stdout.",
     )
     return parser.parse_args()
 
@@ -382,7 +388,21 @@ def main() -> int:
             ),
         }
 
-    if args.json:
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        original_stdout = sys.stdout
+        try:
+            with output.open("w") as stream:
+                sys.stdout = stream
+                if args.json:
+                    render_json(results, lua_results)
+                else:
+                    render_text(results, lua_results)
+        finally:
+            sys.stdout = original_stdout
+        print(f"wrote {output}", file=sys.stderr)
+    elif args.json:
         render_json(results, lua_results)
     else:
         render_text(results, lua_results)

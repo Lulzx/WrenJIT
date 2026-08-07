@@ -1,32 +1,77 @@
+diff --git a/src/vm/wren_compiler.c b/src/vm/wren_compiler.c
+index 47705f5..74432b9 100644
+--- a/src/vm/wren_compiler.c
++++ b/src/vm/wren_compiler.c
+@@ -1,13 +1,14 @@
+ #include <errno.h>
+ #include <stdbool.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #include "wren_common.h"
+ #include "wren_compiler.h"
+ #include "wren_vm.h"
+ 
+-#if WREN_DEBUG_DUMP_COMPILED_CODE
++#if WREN_DEBUG_DUMP_COMPILED_CODE || defined(WREN_JIT)
+   #include "wren_debug.h"
+ #endif
+ 
+@@ -1701,6 +1702,9 @@ static ObjFn* endCompiler(Compiler* compiler,
+   
+   #if WREN_DEBUG_DUMP_COMPILED_CODE
+     wrenDumpCode(compiler->parser->vm, compiler->fn);
++  #elif defined(WREN_JIT)
++    if (getenv("WREN_JIT_DUMP_CODE") != NULL)
++      wrenDumpCode(compiler->parser->vm, compiler->fn);
+   #endif
+ 
+   return compiler->fn;
 diff --git a/src/vm/wren_value.c b/src/vm/wren_value.c
-index ce29e07..3345a48 100644
+index ce29e07..c5b8bd8 100644
 --- a/src/vm/wren_value.c
 +++ b/src/vm/wren_value.c
-@@ -257,6 +257,9 @@ ObjFn* wrenNewFunction(WrenVM* vm, ObjModule* module, int maxSlots)
+@@ -5,6 +5,9 @@
+ 
+ #include "wren.h"
+ #include "wren_value.h"
++#ifdef WREN_JIT
++#include "wren_jit_recursion.h"
++#endif
+ #include "wren_vm.h"
+ 
+ #if WREN_DEBUG_TRACE_MEMORY
+@@ -257,6 +260,13 @@ ObjFn* wrenNewFunction(WrenVM* vm, ObjModule* module, int maxSlots)
    fn->numUpvalues = 0;
    fn->arity = 0;
    fn->debug = debug;
 +#ifdef WREN_JIT
 +  fn->jitHotCounts = NULL;
++  fn->jitCallCount = 0;
++  fn->jitRecursiveCode = NULL;
++  fn->jitRecursiveKind = 0;
++  fn->jitRecursiveArity = 0;
 +#endif
    
    return fn;
  }
-@@ -1253,6 +1256,9 @@ void wrenFreeObj(WrenVM* vm, Obj* obj)
+@@ -1253,6 +1263,10 @@ void wrenFreeObj(WrenVM* vm, Obj* obj)
        ObjFn* fn = (ObjFn*)obj;
        wrenValueBufferClear(vm, &fn->constants);
        wrenByteBufferClear(vm, &fn->code);
 +#ifdef WREN_JIT
 +      DEALLOCATE(vm, fn->jitHotCounts);
++      wrenJitFreeRecursiveCode(fn->jitRecursiveCode, fn->jitRecursiveKind);
 +#endif
        wrenIntBufferClear(vm, &fn->debug->sourceLines);
        DEALLOCATE(vm, fn->debug->name);
        DEALLOCATE(vm, fn->debug);
 diff --git a/src/vm/wren_value.h b/src/vm/wren_value.h
-index 2ca0cfd..001f794 100644
+index 2ca0cfd..9c7d62a 100644
 --- a/src/vm/wren_value.h
 +++ b/src/vm/wren_value.h
-@@ -265,6 +265,12 @@ typedef struct
+@@ -265,6 +265,16 @@ typedef struct
    // only be set for fns, and not ObjFns that represent methods or scripts.
    int arity;
    FnDebug* debug;
@@ -35,27 +80,33 @@ index 2ca0cfd..001f794 100644
 +  // Per-loop-header hot counters, allocated lazily by the JIT.
 +  // Indexed by bytecode offset of LOOP instructions.
 +  uint16_t* jitHotCounts;
++  uint16_t jitCallCount;
++  void* jitRecursiveCode;
++  uint8_t jitRecursiveKind;
++  uint8_t jitRecursiveArity;
 +#endif
  } ObjFn;
  
  // An instance of a first-class function and the environment it has closed over.
 diff --git a/src/vm/wren_vm.c b/src/vm/wren_vm.c
-index f63ab8c..dfd8b07 100644
+index f63ab8c..c0f4c4a 100644
 --- a/src/vm/wren_vm.c
 +++ b/src/vm/wren_vm.c
-@@ -16,6 +16,11 @@
+@@ -16,6 +16,13 @@
    #include "wren_opt_random.h"
  #endif
  
 +#ifdef WREN_JIT
++  #include <stdio.h>
 +  #include "wren_jit.h"
 +  #include "wren_jit_trace.h"
++  #include "wren_jit_recursion.h"
 +#endif
 +
  #if WREN_DEBUG_TRACE_MEMORY || WREN_DEBUG_TRACE_GC
    #include <time.h>
    #include <stdio.h>
-@@ -93,6 +98,11 @@ WrenVM* wrenNewVM(WrenConfiguration* config)
+@@ -93,6 +100,11 @@ WrenVM* wrenNewVM(WrenConfiguration* config)
  
    vm->modules = wrenNewMap(vm);
    wrenInitializeCore(vm);
@@ -67,7 +118,7 @@ index f63ab8c..dfd8b07 100644
    return vm;
  }
  
-@@ -119,6 +129,14 @@ void wrenFreeVM(WrenVM* vm)
+@@ -119,6 +131,14 @@ void wrenFreeVM(WrenVM* vm)
  
    wrenSymbolTableClear(vm, &vm->methodNames);
  
@@ -82,7 +133,7 @@ index f63ab8c..dfd8b07 100644
    DEALLOCATE(vm, vm);
  }
  
-@@ -168,6 +186,12 @@ void wrenCollectGarbage(WrenVM* vm)
+@@ -168,6 +188,12 @@ void wrenCollectGarbage(WrenVM* vm)
    // Method names.
    wrenBlackenSymbolTable(vm, &vm->methodNames);
  
@@ -95,7 +146,7 @@ index f63ab8c..dfd8b07 100644
    // Now that we have grayed the roots, do a depth-first search over all of the
    // reachable objects.
    wrenBlackenObjects(vm);
-@@ -887,6 +911,28 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -887,6 +913,28 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
      #define DEBUG_TRACE_INSTRUCTIONS() do { } while (false)
    #endif
  
@@ -124,7 +175,7 @@ index f63ab8c..dfd8b07 100644
    #if WREN_COMPUTED_GOTO
  
    static void* dispatchTable[] = {
-@@ -902,6 +948,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -902,6 +950,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
        do                                                                       \
        {                                                                        \
          DEBUG_TRACE_INSTRUCTIONS();                                            \
@@ -132,7 +183,7 @@ index f63ab8c..dfd8b07 100644
          goto *dispatchTable[instruction = (Code)READ_BYTE()];                  \
        } while (false)
  
-@@ -910,6 +957,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -910,6 +959,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
    #define INTERPRET_LOOP                                                       \
        loop:                                                                    \
          DEBUG_TRACE_INSTRUCTIONS();                                            \
@@ -140,7 +191,116 @@ index f63ab8c..dfd8b07 100644
          switch (instruction = (Code)READ_BYTE())
  
    #define CASE_CODE(name)  case CODE_##name
-@@ -1158,6 +1206,62 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -1079,6 +1129,108 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+           break;
+ 
+         case METHOD_BLOCK:
++          #ifdef WREN_JIT
++          if (vm->jit != NULL && vm->jit->enabled && numArgs == 1 &&
++              IS_INSTANCE(args[0]))
++          {
++            ObjFn* calledFn = method->as.closure->fn;
++            ObjClass* receiverClass = AS_INSTANCE(args[0])->obj.classObj;
++            if (calledFn->jitRecursiveCode == NULL &&
++                calledFn->jitCallCount != JIT_HOT_BLACKLISTED &&
++                ++calledFn->jitCallCount >= vm->jit->hot_threshold)
++            {
++              calledFn->jitRecursiveCode =
++                  wrenJitCompileRecursiveNumeric(vm, calledFn, receiverClass,
++                                                 &calledFn->jitRecursiveKind,
++                                                 &calledFn->jitRecursiveArity);
++              if (calledFn->jitRecursiveCode == NULL)
++                calledFn->jitCallCount = JIT_HOT_BLACKLISTED;
++              else
++                vm->jit->traces_compiled++;
++            }
++            if (calledFn->jitRecursiveKind == JIT_RECURSIVE_TREE_CHECK &&
++                calledFn->jitRecursiveCode == receiverClass)
++            {
++              int64_t nativeResult;
++              if (wrenJitRunTreeCheck((uint64_t)args[0], receiverClass,
++                                      &nativeResult))
++              {
++                args[0] = NUM_VAL((double)nativeResult);
++                break;
++              }
++            }
++          }
++          if (vm->jit != NULL && vm->jit->enabled && numArgs >= 2 &&
++              numArgs <= 4 && IS_NUM(args[1]) &&
++              (numArgs < 3 || IS_NUM(args[2])) &&
++              (numArgs < 4 || IS_NUM(args[3])))
++          {
++            ObjFn* calledFn = method->as.closure->fn;
++            if (calledFn->jitRecursiveCode == NULL &&
++                calledFn->jitCallCount != JIT_HOT_BLACKLISTED &&
++                ++calledFn->jitCallCount >= vm->jit->hot_threshold)
++            {
++              calledFn->jitRecursiveCode =
++                  wrenJitCompileRecursiveNumeric(vm, calledFn, NULL,
++                                                 &calledFn->jitRecursiveKind,
++                                                 &calledFn->jitRecursiveArity);
++              if (calledFn->jitRecursiveCode == NULL)
++              {
++                if (wrenJitDebugEnabled())
++                  fprintf(stderr, "[JIT] recursive compile rejected %s (%d bytes)\n",
++                          calledFn->debug->name, calledFn->code.count);
++                calledFn->jitCallCount = JIT_HOT_BLACKLISTED;
++              }
++              else
++                vm->jit->traces_compiled++;
++            }
++            double recursiveArg = AS_NUM(args[1]);
++            double recursiveArg2 = numArgs >= 3 ? AS_NUM(args[2]) : 0;
++            double recursiveArg3 = numArgs >= 4 ? AS_NUM(args[3]) : 0;
++            if (calledFn->jitRecursiveCode != NULL &&
++                calledFn->jitRecursiveArity == (uint8_t)(numArgs - 1) &&
++                recursiveArg == (double)(int64_t)recursiveArg &&
++                recursiveArg >= -(double)(1LL << 53) &&
++                recursiveArg <= (double)(1LL << 53) &&
++                recursiveArg2 == (double)(int64_t)recursiveArg2 &&
++                recursiveArg2 >= -(double)(1LL << 53) &&
++                recursiveArg2 <= (double)(1LL << 53) &&
++                recursiveArg3 == (double)(int64_t)recursiveArg3 &&
++                recursiveArg3 >= -(double)(1LL << 53) &&
++                recursiveArg3 <= (double)(1LL << 53))
++            {
++              if (calledFn->jitRecursiveKind == JIT_RECURSIVE_TREE_MAKE)
++              {
++                if (wrenJitRunTreeMake(vm, calledFn->jitRecursiveCode,
++                                       (int64_t)recursiveArg,
++                                       (uint64_t*)&args[0]))
++                {
++                  fiber->stackTop -= numArgs - 1;
++                  break;
++                }
++              }
++              else
++              {
++              int64_t nativeResult;
++              if (calledFn->jitRecursiveArity == 1)
++                nativeResult = ((JitRecursiveIntFunc)calledFn->jitRecursiveCode)(
++                    (int64_t)recursiveArg);
++              else if (calledFn->jitRecursiveArity == 2)
++                nativeResult = ((JitRecursiveIntFunc2)calledFn->jitRecursiveCode)(
++                    (int64_t)recursiveArg, (int64_t)recursiveArg2);
++              else
++                nativeResult = ((JitRecursiveIntFunc3)calledFn->jitRecursiveCode)(
++                    (int64_t)recursiveArg, (int64_t)recursiveArg2,
++                    (int64_t)recursiveArg3);
++              args[0] = calledFn->jitRecursiveKind == JIT_RECURSIVE_RESULT_BOOL
++                  ? BOOL_VAL(nativeResult != 0)
++                  : NUM_VAL((double)nativeResult);
++              fiber->stackTop -= numArgs - 1;
++              break;
++              }
++            }
++          }
++          #endif
+           STORE_FRAME();
+           wrenCallFunction(vm, fiber, (ObjClosure*)method->as.closure, numArgs);
+           LOAD_FRAME();
+@@ -1158,6 +1310,62 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
        // Jump back to the top of the loop.
        uint16_t offset = READ_SHORT();
        ip -= offset;

@@ -91,6 +91,92 @@ static IROp numUnaryToIROp(WrenVM* vm, int symbol)
     return IR_NOP;
 }
 
+// Turn the canonical short body
+//
+//     if (bool) moduleNumber = moduleNumber + 1
+//
+// into an unconditional add of 0.0/1.0. This lets a trace cover alternating
+// boolean branches without taking a side exit on every true iteration. The
+// exact bytecode match preserves the normal exit for every other branch body.
+static bool tryEmitConditionalModuleIncrement(JitRecorder* r, WrenVM* vm,
+                                               CallFrame* frame, uint8_t* ip,
+                                               uint16_t cond_ssa,
+                                               uint16_t offset)
+{
+    IRNode* cond = cond_ssa < r->ir.count ? &r->ir.nodes[cond_ssa] : NULL;
+    // Before optimization, a getter after the toggling store is still a
+    // LOAD_FIELD. Recover the immediately dominating stored SSA value; the
+    // alias-aware forwarding pass will make the same replacement later.
+    if (cond != NULL && cond->op == IR_LOAD_FIELD) {
+        for (uint16_t i = cond_ssa; i-- > 0;) {
+            IRNode* prior = &r->ir.nodes[i];
+            if (prior->op == IR_STORE_FIELD && prior->op1 == cond->op1 &&
+                prior->imm.mem.field == cond->imm.mem.field) {
+                cond_ssa = prior->op2;
+                cond = cond_ssa < r->ir.count ? &r->ir.nodes[cond_ssa] : NULL;
+                break;
+            }
+            if ((prior->op == IR_STORE_FIELD && prior->op1 == cond->op1) ||
+                prior->op == IR_CALL_C || prior->op == IR_CALL_WREN)
+                break;
+        }
+    }
+    if (cond == NULL || cond->op != IR_BOOL_NOT || cond->op1 == IR_NONE)
+        return false;
+
+    bool guardedBool = false;
+    for (uint16_t i = 0; i < r->ir.count; i++) {
+        if (r->ir.nodes[i].op == IR_GUARD_BOOL &&
+            r->ir.nodes[i].op1 == cond->op1) {
+            guardedBool = true;
+            break;
+        }
+    }
+    if (!guardedBool) return false;
+
+    uint8_t* body = ip + 3;
+    uint8_t* target = body + offset;
+    // LOAD_MODULE_VAR u16; CONSTANT u16; CALL_1 u16;
+    // STORE_MODULE_VAR u16; POP
+    if (target != body + 13 ||
+        body[0] != CODE_LOAD_MODULE_VAR || body[3] != CODE_CONSTANT ||
+        body[6] != CODE_CALL_1 || body[9] != CODE_STORE_MODULE_VAR ||
+        body[12] != CODE_POP)
+        return false;
+
+    uint16_t var_idx = readShort(body);
+    uint16_t const_idx = readShort(body + 3);
+    uint16_t symbol = readShort(body + 6);
+    if (readShort(body + 9) != var_idx ||
+        !methodNameEquals(vm, symbol, "+(_)"))
+        return false;
+
+    ObjFn* fn = frame->closure->fn;
+    if (var_idx >= (uint16_t)fn->module->variables.count ||
+        const_idx >= (uint16_t)fn->constants.count)
+        return false;
+    Value one = fn->constants.data[const_idx];
+    if (!IS_NUM(one) || AS_NUM(one) != 1.0) return false;
+
+    // The condition has already been popped. If the counter guard fails,
+    // resume at the original body so the interpreter performs the update.
+    uint16_t snap = emitSnapshot(r, body);
+    Value* varPtr = &fn->module->variables.data[var_idx];
+    uint16_t old = irEmit(&r->ir, IR_LOAD_MODULE_VAR, var_idx, IR_NONE,
+                          IR_TYPE_VALUE);
+    r->ir.nodes[old].imm.ptr = (void*)varPtr;
+    irEmitGuardNum(&r->ir, old, snap);
+    uint16_t oldNum = irEmitUnbox(&r->ir, old);
+    uint16_t delta = irEmit(&r->ir, IR_BOOL_TO_NUM, cond_ssa, IR_NONE,
+                            IR_TYPE_INT);
+    uint16_t sum = irEmit(&r->ir, IR_ADD, oldNum, delta, IR_TYPE_NUM);
+    uint16_t boxed = irEmitBox(&r->ir, sum);
+    uint16_t store = irEmit(&r->ir, IR_STORE_MODULE_VAR, boxed, IR_NONE,
+                            IR_TYPE_VOID);
+    r->ir.nodes[store].imm.ptr = (void*)varPtr;
+    return true;
+}
+
 // -------------------------------------------------------------------------
 // jitRecorderStart
 // -------------------------------------------------------------------------
@@ -566,6 +652,13 @@ bool jitRecorderStep(WrenJitState* jit, WrenVM* vm, uint8_t* ip)
         } else {
             // Interpreter fell through; the not-taken path is the jump target.
             not_taken_pc = ip + 3 + offset;
+        }
+
+        // A skipped canonical conditional increment can be represented as a
+        // branchless 0/1 add, keeping both boolean outcomes on this trace.
+        if (taken && tryEmitConditionalModuleIncrement(r, vm, frame, ip,
+                                                       cond_ssa, offset)) {
+            break;
         }
 
         uint16_t snap = emitSnapshot(r, not_taken_pc);

@@ -188,6 +188,20 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
             if (i > range_end[n->op2])
                 range_end[n->op2] = i;
         }
+        if (n->op == IR_TOGGLE_COUNT_BULK) {
+            uint16_t hidden[3] = { n->imm.bulk.limit, n->imm.bulk.state,
+                                   n->imm.bulk.object };
+            for (int h = 0; h < 3; h++) {
+                uint16_t ref = hidden[h];
+                if (ref < buf->count && defined[ref] && i > range_end[ref])
+                    range_end[ref] = i;
+            }
+        }
+        if (n->op == IR_RANGE_SUM_BULK) {
+            uint16_t ref = n->imm.arith.limit;
+            if (ref < buf->count && defined[ref] && i > range_end[ref])
+                range_end[ref] = i;
+        }
     }
 
     // Pass 2: Extend snapshot entries' live ranges.
@@ -254,6 +268,23 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
         if (n->op == IR_LOOP_BACK) {
             loop_end = i;
             break;
+        }
+    }
+
+    // Pre-header integer-conversion guards are emitted at LOOP_HEADER after
+    // all pre-header values exist. Keep both the boxed source and converted
+    // integer alive until that delayed validation; otherwise linear scan may
+    // reuse the source register before codegen performs the equality check.
+    if (loop_header != IR_NONE) {
+        for (uint16_t i = 0; i < loop_header; i++) {
+            const IRNode* n = &buf->nodes[i];
+            if (n->op != IR_UNBOX_INT || !(n->flags & IR_FLAG_INT_GUARD))
+                continue;
+            if (n->op1 < buf->count && defined[n->op1] &&
+                range_end[n->op1] < loop_header)
+                range_end[n->op1] = loop_header;
+            if (defined[i] && range_end[i] < loop_header)
+                range_end[i] = loop_header;
         }
     }
 

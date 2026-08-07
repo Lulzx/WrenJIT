@@ -9,6 +9,7 @@
 // and replaces in-loop UNBOX_NUM(LOAD_MODULE_VAR) with the PHI so that
 // IV type inference can fire and eliminate FP box/unbox overhead.
 void irOptPromoteLoopVars(IRBuffer* buf);
+void irOptPromoteNumericStackPhis(IRBuffer* buf);
 
 // Run all optimization passes on the IR buffer.
 // Passes run in order:
@@ -33,11 +34,13 @@ void irOptConstPropFold(IRBuffer* buf);
 void irOptGVN(IRBuffer* buf);
 void irOptLICM(IRBuffer* buf);
 void irOptGuardHoist(IRBuffer* buf);
+void irOptHoistGuardedRangeLoads(IRBuffer* buf);
 void irOptStrengthReduce(IRBuffer* buf);
 void irOptBoundsCheckElim(IRBuffer* buf);
 void irOptEscapeAnalysis(IRBuffer* buf);
 void irOptDCE(IRBuffer* buf);
 void irOptGuardElim(IRBuffer* buf);
 void irOptIVTypeInference(IRBuffer* buf);
+void irOptFuseComparisonGuards(IRBuffer* buf);
 
 #endif // wren_jit_opt_h

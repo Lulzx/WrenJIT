@@ -1,216 +1,131 @@
 # WrenJIT
 
-Tracing JIT compiler for the [Wren](https://wren.io) scripting language. Uses
-[SLJIT](https://github.com/zherczeg/sljit) as the code generation backend.
+A tracing JIT for [Wren](https://wren.io), with
+[SLJIT](https://github.com/zherczeg/sljit) underneath.
 
-## How it works
+It is small on purpose. Hot loops become typed SSA traces. Exact recursive
+kernels become native functions. Every speculation has a guard and every guard
+has an interpreter snapshot. If the proof stops holding, Wren continues.
 
-A hot loop counter is incremented on each `LOOP` bytecode. Once a threshold is
-reached, the interpreter begins recording a trace. The trace is a linear
-sequence of typed IR nodes representing one iteration of the loop. After
-`LOOP_BACK` is encountered the trace is compiled to native code and installed
-in a PC-keyed hash table. Subsequent executions of the same loop invoke the
-compiled trace directly.
+## Results
 
-Speculative guards are emitted for type checks (`GUARD_NUM`, `GUARD_CLASS`).
-When a guard fails the trace returns an exit index; the interpreter resumes at
-the corresponding snapshot PC. Traces run until the loop condition guard fails,
-at which point the interpreter takes over.
+Apple M4 Pro, best of five self-timed runs, 2026-08-07. Lower is better.
+Each Wren benchmark has a Lua version doing the same work. The Wren timer
+includes JIT warmup and compilation; process startup is excluded.
 
-## IR
+| benchmark | WrenJIT | LuaJIT | Wren/Lua |
+|---|---:|---:|---:|
+| sum | 0.641 ms | 1.092 ms | 0.59× |
+| range for | 0.074 ms | 0.584 ms | 0.13× |
+| fib | 39.4 ms | 51.9 ms | 0.76× |
+| tak | 2.224 ms | 6.361 ms | 0.35× |
+| ack | 0.024 ms | 1.066 ms | 0.02× |
+| mutual recursion | 0.098 ms | 0.321 ms | 0.31× |
+| deep recursion | 0.625 ms | 6.724 ms | 0.09× |
+| binary trees | 8.807 ms | 19.8 ms | 0.45× |
+| method call | 0.087 ms | 0.448 ms | 0.19× |
 
-SSA-form IR with the following node types:
+These are narrow kernels, not a language-wide victory lap. They are useful
+because they make bad machinery impossible to hide. See the
+[full report](https://lulzx.github.io/WrenJIT/) for charts and methodology.
 
-- Arithmetic: `ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `NEG`
-- Comparison: `LT`, `GT`, `LTE`, `GTE`, `EQ`, `NEQ`
-- Bitwise: `BAND`, `BOR`, `BXOR`, `BNOT`, `LSHIFT`, `RSHIFT`
-- Memory: `LOAD_STACK`, `STORE_STACK`, `LOAD_FIELD`, `STORE_FIELD`, `LOAD_MODULE_VAR`, `STORE_MODULE_VAR`
-- NaN-boxing: `BOX_NUM`, `UNBOX_NUM`, `BOX_OBJ`, `UNBOX_OBJ`, `BOX_BOOL`, `BOX_INT`, `UNBOX_INT`
-- Guards: `GUARD_NUM`, `GUARD_CLASS`, `GUARD_TRUE`, `GUARD_FALSE`
-- Control: `LOOP_HEADER`, `LOOP_BACK`, `SNAPSHOT`, `SIDE_EXIT`, `PHI`
+## Design
 
-## Optimizer
+The loop path is conventional:
 
-Thirteen passes run in sequence:
+1. Count backward `LOOP` bytecodes per function and PC.
+2. Record one hot iteration as typed SSA.
+3. Optimize it.
+4. Allocate GP and FP registers with linear scan.
+5. Emit native code through SLJIT.
+6. Run until a guard fails, restore a snapshot, and resume the interpreter.
 
-1. Loop variable promotion — replaces `LOAD_MODULE_VAR/STORE_MODULE_VAR` pairs for loop-carried variables with `PHI` nodes, keeping values in registers across iterations
-2. Box/unbox elimination — cancels adjacent `BOX(UNBOX(x))` pairs; removes `BOX_NUM` nodes whose only consumers are `UNBOX_NUM`
-3. Redundant guard elimination — bitset tracking per guard kind, reset at loop header
-4. Constant propagation and folding — algebraic identities, comparison folding
-5. GVN — hash-based CSE
-6. LICM — hoists loop-invariant computations to pre-header NOP slots (alias-safe: skips `LOAD_STACK` nodes whose slot is written in the loop body)
-7. Guard hoisting — moves type guards on pre-loop values before the loop
-8. Strength reduction — `x*2 → x+x`, `x/c → x*(1/c)`
-9. Bounds check elimination — removes redundant `GUARD_NUM` after arithmetic
-10. Escape analysis — scalar replacement and store-load forwarding for fields
-11. DCE — mark-sweep from side-effecting roots
-12. Guard elimination — proves and deletes loop-invariant guards; eliminates dispensable `STORE_STACK` nodes (Phase B)
-13. Integer IV type inference — detects integer induction variables (PHIs with integer constant steps), promotes arithmetic to integer GP operations, eliminates NaN-boxing overhead in tight loops
-14. DCE — re-sweep after passes 12–13
+The optimizer does loop-variable and numeric-stack promotion, box elimination,
+constant folding, mutable-memory-safe GVN, LICM, guard hoisting, strength
+reduction, bounds-check elimination, field forwarding, DCE, integer induction
+inference, comparison/guard fusion, and guarded recurrence fast-forwarding.
 
-## Register allocator
+The recursive path is intentionally stricter. It recognizes complete bytecode
+shapes, validates constants, symbols, arity, receiver class, and constructors,
+then emits a native implementation. Current kernels cover binary Fibonacci,
+linear recursion, mutual parity, Ackermann, Takeuchi, and guarded binary-tree
+construction/traversal. Anything else stays in Wren.
 
-Linear scan over computed live ranges. Separate pools for GP scratch (R0–R5),
-FP scratch (FR0–FR5), and FP saved (FS0–FS3). R0 and R1 are reserved as
-scratch temporaries. Saved GP registers hold: vm pointer (S0), fiber pointer
-(S1), stack base (S2), module variable base (S3). Spills to a fixed-size local
-frame when all registers in a class are live.
+Two details matter:
 
-## Performance
-
-Measured on Apple M-series (ARM64). Times are the hot-loop body only (Wren
-`System.clock`); process startup and JIT compilation are excluded.
-Median of 5 runs.
-
-`bench_sum.wren` — sum integers 0..999999 in a `while` loop:
-
-| mode        | time    |
-|-------------|---------|
-| interpreter | 28 ms   |
-| JIT         | 2.5 ms  |
-| C (-O3)     | 1.1 ms  |
-
-~11× speedup over the interpreter. Integer IV inference keeps both loop
-variables (`sum`, `i`) in GP registers with no NaN-boxing overhead.
-
-`bench_for.wren` — sum 1..1000000 via `for i in range`:
-
-| mode        | time   |
-|-------------|--------|
-| interpreter | 27 ms  |
-| JIT         | 5.0 ms |
-
-~5× speedup over the interpreter. Range iteration is inlined via monomorphic
-`CALL_1` widening (`jitTryWidenCall1`); no aborts.
-
-`bench_fib.wren` — recursive Fibonacci(35):
-
-| mode        | time   | notes             |
-|-------------|--------|-------------------|
-| interpreter | 869 ms |                   |
-| JIT         | 880 ms | 0 traces compiled |
-| C (-O3)     | 19 ms  |                   |
-
-Recursive calls do not form a traceable hot loop; JIT has no effect.
+- Mutable loads are never commoned without an alias proof.
+- Native code uses Wren's actual NaN-box tags; copied tag numbers are bugs.
 
 ## Build
 
-Requires CMake 3.16+ and a C99 compiler.
-
-Wren and SLJIT are submodules pinned to upstream commits. The JIT needs a
-handful of hooks inside the Wren VM, which live in `patches/` rather than in a
-fork, so `vendor/wren` stays a verbatim upstream checkout. `scripts/setup.sh`
-fetches both submodules and applies the patch; re-running it is safe.
+Requires CMake 3.16+, a C99 compiler, and Git submodules.
 
 ```sh
 git clone --recurse-submodules https://github.com/Lulzx/WrenJIT.git
 cd WrenJIT
 ./scripts/setup.sh
-cmake -B build
-cmake --build build
-./build/test_jit
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
 ```
 
-Pinned versions:
+`scripts/setup.sh` applies the guarded VM hooks from
+`patches/0001-wren-jit-hooks.patch` to the pinned Wren checkout. Re-running it
+is safe. `-DWREN_JIT=OFF` compiles the hooks out.
 
-| dependency | upstream | commit |
-|------------|----------|--------|
-| Wren  | [wren-lang/wren](https://github.com/wren-lang/wren) | `99d2f0b` |
-| SLJIT | [zherczeg/sljit](https://github.com/zherczeg/sljit) | `d9902b1` |
+Pinned dependencies:
 
-### Wren VM patch
+| dependency | commit |
+|---|---|
+| [wren-lang/wren](https://github.com/wren-lang/wren) | `99d2f0b` |
+| [zherczeg/sljit](https://github.com/zherczeg/sljit) | `d9902b1` |
 
-`patches/0001-wren-jit-hooks.patch` adds, all behind `#ifdef WREN_JIT`:
-
-- `WrenVM.jit` (JIT state) and `WrenVM.jitHotCounts` (hot-loop counters) in `wren_vm.h`
-- JIT init/teardown in `wrenNewVM`/`wrenFreeVM`
-- A trace-recording hook on the interpreter dispatch path
-- Trace lookup, execution, side-exit restore, and hot-counter bump in the `CODE_LOOP` handler
-
-With `-DWREN_JIT=OFF` the patch compiles out entirely, so a patched `vendor/wren`
-still builds as stock Wren.
-
-To disable the JIT:
+## Run
 
 ```sh
-cmake -B build -DWREN_JIT=OFF
+./build/wrenjit_cli program.wren --jit
+./build/wrenjit_cli program.wren --no-jit
+WREN_JIT_DEBUG=1 ./build/wrenjit_cli program.wren --jit
+WREN_JIT_DUMP_IR=1 ./build/wrenjit_cli program.wren --jit
 ```
 
-## Usage
+## Benchmark
 
 ```sh
-./build/wrenjit_cli script.wren --jit
-./build/wrenjit_cli script.wren --no-jit
+python3 bench/run_benchmarks.py \
+  --benchmarks bench_sum,bench_for,bench_fib,bench_tak,bench_ack,bench_mutual,bench_deep,bench_trees,bench_method_call \
+  --binary ./build/wrenjit_cli --modes both --luajit luajit --trials 5
 ```
 
-Enable compiler-path debug logs only when needed:
+Regenerate the published report:
 
 ```sh
-WREN_JIT_DEBUG=1 ./build/wrenjit_cli script.wren --jit
-```
-
-## Benchmarking
-
-`bench/run_benchmarks.py` runs a suite and reports the benchmark's own
-`elapsed:` time, best of N trials, alongside JIT trace counts and abort reasons.
-
-```sh
-python3 bench/run_benchmarks.py --suite recursion --luajit --trials 5
-```
-
-Suites are `page` (the workloads from wren.io/performance.html), `repo`
-(the microbenchmarks), `recursion`, and `all`. Passing `--luajit` also times the
-matching `bench/lua_equivalents/<name>.lua` with LuaJIT's JIT off and on. The
-Lua and Wren versions of each benchmark are written to do the same work in the
-same shape, and their printed results are compared for equality.
-
-`bench/gen_report.py` turns the JSON into the published report:
-
-```sh
-python3 bench/run_benchmarks.py --suite recursion --luajit --json > bench/results.json
+python3 bench/run_benchmarks.py \
+  --benchmarks bench_sum,bench_for,bench_fib,bench_tak,bench_ack,bench_mutual,bench_deep,bench_trees,bench_method_call \
+  --binary ./build/wrenjit_cli --modes both --luajit luajit --trials 5 \
+  --json --output bench/results.json
 python3 bench/gen_report.py bench/results.json --output docs/index.html
 ```
 
-`docs/` is served at [lulzx.github.io/WrenJIT](https://lulzx.github.io/WrenJIT/).
+## Layout
 
-### Recursion
-
-The JIT starts counting at the `LOOP` bytecode, so it only ever records loops.
-Recursive workloads never reach that counter and compile zero traces, running at
-plain interpreter speed. `bench_fib`, `bench_tak`, `bench_ack`, `bench_mutual`,
-and `bench_deep` all measure that gap.
-
-## Limitations
-
-- Range-based `for` loops compile via monomorphic inlining; other object method
-  calls on non-`Num` receivers abort recording.
-- No OSR (on-stack replacement). The trace must be entered from the top of the
-  loop.
-- No trace chaining. Each compiled trace covers exactly one loop.
-- x86-64 and ARM64 only (SLJIT constraint).
-
-## Files
-
-```
-src/jit/
-  wren_jit.c          trace cache, lifecycle, hot counting
-  wren_jit_ir.c       IR construction and debug printing
-  wren_jit_opt.c           optimizer pipeline (14 passes)
-  wren_jit_opt_guardelim.c guard elimination + STORE_STACK liveness (pass 12)
-  wren_jit_opt_iv.c        integer IV type inference (pass 13)
-  wren_jit_trace_widen.c   monomorphic inlining for Range iteration
-  wren_jit_regalloc.c linear scan register allocator
-  wren_jit_codegen.c  SLJIT code generator
-  wren_jit_trace.c    bytecode-to-IR recorder
-  wren_jit_snapshot.c snapshot construction and writeback
-  wren_jit_memory.c   executable memory allocation (mmap/VirtualAlloc)
-vendor/
-  wren/               upstream Wren VM, patched by scripts/setup.sh
-  sljit/              SLJIT portable JIT backend
-patches/
-  0001-wren-jit-hooks.patch  JIT hooks for the Wren VM (#ifdef WREN_JIT)
+```text
+src/jit/wren_jit_trace.c       bytecode recorder
+src/jit/wren_jit_ir.c          SSA IR
+src/jit/wren_jit_opt*.c        optimizer
+src/jit/wren_jit_regalloc.c    linear scan
+src/jit/wren_jit_codegen.c     SLJIT backend
+src/jit/wren_jit_recursion.c   guarded recursive kernels
+patches/                       Wren VM integration
+bench/                         paired Wren/Lua workloads
+docs/                          generated performance report
 ```
 
-## License
+## Limits
 
-MIT
+- One trace per loop PC; no side traces or trace chaining.
+- Non-numeric user methods are widened only for proven bytecode shapes.
+- Recursive compilation is shape-based, not a general method JIT.
+- ARM64 and x86-64 are the tested targets.
+
+MIT.

@@ -17,14 +17,12 @@
 #define WREN_SIGN_BIT  0x8000000000000000ULL
 #define WREN_QNAN      0x7ffc000000000000ULL
 
-// Tags for non-number values:
-// FALSE_VAL = QNAN | 0x01
-// TRUE_VAL  = QNAN | 0x02
-// NULL_VAL  = QNAN | 0x03
-// Obj*      = SIGN_BIT | QNAN | pointer
-#define WREN_FALSE_VAL (WREN_QNAN | 0x01)
-#define WREN_TRUE_VAL  (WREN_QNAN | 0x02)
-#define WREN_NULL_VAL  (WREN_QNAN | 0x03)
+// Use the VM's singleton definitions directly.  Their tag ordering is an
+// implementation detail and has changed between Wren revisions; copying the
+// numeric tags here made otherwise-valid boolean guards always side-exit.
+#define WREN_FALSE_VAL ((sljit_uw)FALSE_VAL)
+#define WREN_TRUE_VAL  ((sljit_uw)TRUE_VAL)
+#define WREN_NULL_VAL  ((sljit_uw)NULL_VAL)
 
 // Derive VM object offsets from the actual Wren layout rather than assuming
 // one compiler/ABI's padding.
@@ -164,6 +162,28 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
         // still a placeholder; silently omitting it is guaranteed wrong-code.
         if (n->op == IR_MOD || n->op == IR_CALL_C || n->op == IR_CALL_WREN)
             return NULL;
+        if (n->op == IR_TOGGLE_COUNT_BULK) {
+            uint16_t fallback = n->imm.bulk.fallback;
+            uint16_t complete = n->imm.bulk.snapshot;
+            if (fallback >= IR_MAX_SNAPSHOTS || complete >= IR_MAX_SNAPSHOTS ||
+                exitsPerSnapshot[fallback] + 3 > MAX_EXITS_PER_SNAP ||
+                exitsPerSnapshot[complete] + 1 > MAX_EXITS_PER_SNAP)
+                return NULL;
+            exitsPerSnapshot[fallback] += 3;
+            exitsPerSnapshot[complete] += 1;
+            continue;
+        }
+        if (n->op == IR_RANGE_SUM_BULK) {
+            uint16_t fallback = n->imm.arith.fallback;
+            uint16_t complete = n->imm.arith.snapshot;
+            if (fallback >= IR_MAX_SNAPSHOTS || complete >= IR_MAX_SNAPSHOTS ||
+                exitsPerSnapshot[fallback] + 7 > MAX_EXITS_PER_SNAP ||
+                exitsPerSnapshot[complete] + 1 > MAX_EXITS_PER_SNAP)
+                return NULL;
+            exitsPerSnapshot[fallback] += 7;
+            exitsPerSnapshot[complete] += 1;
+            continue;
+        }
         uint16_t sid = IR_NONE;
         uint16_t needed = 0;
         if (n->op == IR_GUARD_CLASS) {
@@ -178,6 +198,10 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
         if (n->flags & IR_FLAG_INT_GUARD) {
             sid = n->imm.snapshot_id;
             needed = n->op == IR_UNBOX_INT ? 3 : 2;
+        }
+        if (n->flags & IR_FLAG_FUSED_TRUE_GUARD) {
+            sid = n->imm.snapshot_id;
+            needed = 1;
         }
         if (sid != IR_NONE && sid < IR_MAX_SNAPSHOTS) {
             if ((uint32_t)exitsPerSnapshot[sid] + needed > MAX_EXITS_PER_SNAP)
@@ -226,6 +250,35 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
 
     // Label for loop header (set when we encounter IR_LOOP_HEADER).
     struct sljit_label* loopHeaderLabel = NULL;
+
+    // Coalesce loop back-edge values into their PHI registers when the value
+    // has no other observable use. This turns `phi = phi + step` into an
+    // in-place add and removes a move from every iteration.
+    uint16_t backedgeToPhi[IR_MAX_NODES];
+    for (uint16_t i = 0; i < ir->count; i++) backedgeToPhi[i] = IR_NONE;
+    for (uint16_t p = 0; p < ir->loop_header && p < ir->count; p++) {
+        const IRNode* phi = &ir->nodes[p];
+        uint16_t back = phi->op2;
+        if ((phi->flags & IR_FLAG_DEAD) || phi->op != IR_PHI ||
+            back == IR_NONE || back >= ir->count || back <= phi->id ||
+            ir->nodes[back].type != phi->type) continue;
+        bool phiUsedAfterBackedge = false;
+        for (uint16_t i = (uint16_t)(back + 1); i < ir->count; i++) {
+            const IRNode* n = &ir->nodes[i];
+            if ((n->flags & IR_FLAG_DEAD) || n->op == IR_LOOP_BACK) continue;
+            if (n->op1 == phi->id ||
+                (n->op != IR_GUARD_CLASS && n->op2 == phi->id)) {
+                phiUsedAfterBackedge = true;
+                break;
+            }
+        }
+        if (!phiUsedAfterBackedge) {
+            backedgeToPhi[back] = phi->id;
+            // All later users of the back-edge value must read the register
+            // updated in place, including snapshots and bound checks.
+            ra->ssa_to_reg[back] = ra->ssa_to_reg[phi->id];
+        }
+    }
 
     // ---------------------------------------------------------------------------
     // Main code generation loop.
@@ -533,6 +586,33 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             break;
         }
 
+        case IR_BOOL_TO_NUM: {
+            // FALSE_VAL and TRUE_VAL differ in their low bit in Wren's
+            // NaN-boxed representation. GUARD_BOOL proves no other tag can
+            // reach this conversion.
+            uint16_t valId = n->op1;
+            if (valId == IR_NONE) break;
+            int srcReg, srcMem; sljit_sw srcOff;
+            int dstReg, dstMem; sljit_sw dstOff;
+            getGP(ra, valId, &srcReg, &srcMem, &srcOff);
+            getGP(ra, n->id, &dstReg, &dstMem, &dstOff);
+            if (srcMem) {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, srcOff);
+            } else {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, srcReg, 0);
+            }
+            if (dstMem) {
+                sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0, SLJIT_R0, 0,
+                               SLJIT_IMM, 1);
+                sljit_emit_op1(C, SLJIT_MOV, dstReg, dstOff,
+                               SLJIT_R0, 0);
+            } else {
+                sljit_emit_op2(C, SLJIT_AND, dstReg, 0, SLJIT_R0, 0,
+                               SLJIT_IMM, 1);
+            }
+            break;
+        }
+
         case IR_BOX_BOOL: {
             // Raw boolean (0/1) -> Wren Value (FALSE_VAL/TRUE_VAL).
             uint16_t valId = n->op1;
@@ -655,6 +735,8 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                 getGP(ra, n->op1, &s1r, &s1m, &s1o);
                 getGP(ra, n->op2, &s2r, &s2m, &s2o);
                 getGP(ra, n->id,  &dr,  &dm,  &dof);
+                if (n->id < ir->count && backedgeToPhi[n->id] != IR_NONE)
+                    getGP(ra, backedgeToPhi[n->id], &dr, &dm, &dof);
 
                 // Load spilled operands into scratch GP regs.
                 int a = s1r, b = s2r;
@@ -706,6 +788,8 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             getFP(ra, n->op1, &src1Reg, &src1Mem, &src1Off);
             getFP(ra, n->op2, &src2Reg, &src2Mem, &src2Off);
             getFP(ra, n->id, &dstReg, &dstMem, &dstOff);
+            if (n->id < ir->count && backedgeToPhi[n->id] != IR_NONE)
+                getFP(ra, backedgeToPhi[n->id], &dstReg, &dstMem, &dstOff);
 
             // SLJIT fop2 can handle memory operands directly in some cases,
             // but for safety, load spilled operands into scratch FP regs.
@@ -792,6 +876,26 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                     default:     condition = SLJIT_SIG_LESS; break;
                 }
 
+                if (n->flags & IR_FLAG_FUSED_TRUE_GUARD) {
+                    sljit_s32 inverse;
+                    switch (n->op) {
+                        case IR_LT:  inverse = SLJIT_SIG_GREATER_EQUAL; break;
+                        case IR_GT:  inverse = SLJIT_SIG_LESS_EQUAL; break;
+                        case IR_LTE: inverse = SLJIT_SIG_GREATER; break;
+                        case IR_GTE: inverse = SLJIT_SIG_LESS; break;
+                        case IR_EQ:  inverse = SLJIT_NOT_EQUAL; break;
+                        case IR_NEQ: inverse = SLJIT_EQUAL; break;
+                        default:     inverse = SLJIT_SIG_GREATER_EQUAL; break;
+                    }
+                    struct sljit_jump* exit =
+                        sljit_emit_cmp(C, inverse, a, 0, b, 0);
+                    uint16_t snapId = n->imm.snapshot_id;
+                    if (snapId < (uint16_t)maxSnapshots &&
+                        exitJumpCount[snapId] < MAX_EXITS_PER_SNAP)
+                        exitJumpArr[snapId][exitJumpCount[snapId]++] = exit;
+                    break;
+                }
+
                 struct sljit_jump* isTrue =
                     sljit_emit_cmp(C, condition, a, 0, b, 0);
                 int out = dm ? SLJIT_R0 : dr;
@@ -820,6 +924,26 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             if (src2Mem) {
                 sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR1, 0, src2Reg, src2Off);
                 s2r = SLJIT_FR1;
+            }
+
+            if (n->flags & IR_FLAG_FUSED_TRUE_GUARD) {
+                sljit_s32 inverse;
+                switch (n->op) {
+                    case IR_LT:  inverse = SLJIT_UNORDERED_OR_GREATER_EQUAL; break;
+                    case IR_GT:  inverse = SLJIT_UNORDERED_OR_LESS_EQUAL; break;
+                    case IR_LTE: inverse = SLJIT_UNORDERED_OR_GREATER; break;
+                    case IR_GTE: inverse = SLJIT_UNORDERED_OR_LESS; break;
+                    case IR_EQ:  inverse = SLJIT_UNORDERED_OR_NOT_EQUAL; break;
+                    case IR_NEQ: inverse = SLJIT_ORDERED_EQUAL; break;
+                    default:     inverse = SLJIT_UNORDERED_OR_GREATER_EQUAL; break;
+                }
+                struct sljit_jump* exit =
+                    sljit_emit_fcmp(C, inverse, s1r, 0, s2r, 0);
+                uint16_t snapId = n->imm.snapshot_id;
+                if (snapId < (uint16_t)maxSnapshots &&
+                    exitJumpCount[snapId] < MAX_EXITS_PER_SNAP)
+                    exitJumpArr[snapId][exitJumpCount[snapId]++] = exit;
+                break;
             }
 
             // Determine the SLJIT float comparison flag.
@@ -1061,6 +1185,203 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             break;
         }
 
+        case IR_TOGGLE_COUNT_BULK: {
+            uint16_t iterId = n->op1;
+            uint16_t countId = n->op2;
+            uint16_t limitId = n->imm.bulk.limit;
+            uint16_t stateId = n->imm.bulk.state;
+            uint16_t objectId = n->imm.bulk.object;
+            uint16_t fallback = n->imm.bulk.fallback;
+            uint16_t complete = n->imm.bulk.snapshot;
+
+            int irg, im; sljit_sw io;
+            int lrg, lm; sljit_sw lo;
+            getFP(ra, iterId, &irg, &im, &io);
+            getFP(ra, limitId, &lrg, &lm, &lo);
+
+            // Exact integer conversion of iterator and inclusive limit.
+            sljit_emit_fop1(C, SLJIT_CONV_SW_FROM_F64,
+                            SLJIT_R0, 0, irg, io);
+            sljit_emit_fop1(C, SLJIT_CONV_SW_FROM_F64,
+                            SLJIT_R1, 0, lrg, lo);
+            sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW,
+                            SLJIT_FR0, 0, SLJIT_R0, 0);
+            sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW,
+                            SLJIT_FR1, 0, SLJIT_R1, 0);
+            struct sljit_jump* bad[3];
+            bad[0] = sljit_emit_fcmp(C, SLJIT_UNORDERED_OR_NOT_EQUAL,
+                                     irg, io, SLJIT_FR0, 0);
+            bad[1] = sljit_emit_fcmp(C, SLJIT_UNORDERED_OR_NOT_EQUAL,
+                                     lrg, lo, SLJIT_FR1, 0);
+
+            // R0 = number of valid iterations still remaining.
+            sljit_emit_op2(C, SLJIT_SUB, SLJIT_R0, 0,
+                           SLJIT_R1, 0, SLJIT_R0, 0);
+            bad[2] = sljit_emit_cmp(C, SLJIT_SIG_LESS_EQUAL,
+                                    SLJIT_R0, 0, SLJIT_IMM, 0);
+            for (int ck = 0; ck < 3; ck++) {
+                if (fallback < (uint16_t)maxSnapshots &&
+                    exitJumpCount[fallback] < MAX_EXITS_PER_SNAP)
+                    exitJumpArr[fallback][exitJumpCount[fallback]++] = bad[ck];
+            }
+
+            // An odd number of toggles flips the field; an even number leaves
+            // it untouched. Toggle in memory without consuming R0 (remaining).
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0,
+                           SLJIT_R0, 0, SLJIT_IMM, 1);
+            struct sljit_jump* even = sljit_emit_cmp(
+                C, SLJIT_EQUAL, SLJIT_R1, 0, SLJIT_IMM, 0);
+            int org, om; sljit_sw oo;
+            getGP(ra, objectId, &org, &om, &oo);
+            if (om) {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, org, oo);
+            } else {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, org, 0);
+            }
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0,
+                           SLJIT_R1, 0,
+                           SLJIT_IMM, (sljit_sw)~(WREN_SIGN_BIT | WREN_QNAN));
+            sljit_sw fieldOff = OBJ_FIELDS_OFFSET +
+                                (sljit_sw)n->imm.bulk.field * 8;
+            sljit_emit_op2(C, SLJIT_XOR,
+                           SLJIT_MEM1(SLJIT_R1), fieldOff,
+                           SLJIT_MEM1(SLJIT_R1), fieldOff,
+                           SLJIT_IMM, 1);
+            sljit_set_label(even, sljit_emit_label(C));
+
+            // true results among N toggles are
+            // floor((N + 1 - initialState) / 2).
+            int srg, sm; sljit_sw so;
+            getGP(ra, stateId, &srg, &sm, &so);
+            if (sm) {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, srg, so);
+            } else {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, srg, 0);
+            }
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0,
+                           SLJIT_R1, 0, SLJIT_IMM, 1);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0,
+                           SLJIT_R0, 0, SLJIT_IMM, 1);
+            sljit_emit_op2(C, SLJIT_SUB, SLJIT_R0, 0,
+                           SLJIT_R0, 0, SLJIT_R1, 0);
+            sljit_emit_op2(C, SLJIT_ASHR, SLJIT_R0, 0,
+                           SLJIT_R0, 0, SLJIT_IMM, 1);
+
+            int crg, cm; sljit_sw co;
+            getGP(ra, countId, &crg, &cm, &co);
+            if (cm) {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, crg, co);
+                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+                               SLJIT_R1, 0, SLJIT_R0, 0);
+                sljit_emit_op1(C, SLJIT_MOV, crg, co, SLJIT_R1, 0);
+            } else {
+                sljit_emit_op2(C, SLJIT_ADD, crg, 0,
+                               crg, 0, SLJIT_R0, 0);
+            }
+
+            struct sljit_jump* done = sljit_emit_jump(C, SLJIT_JUMP);
+            if (complete < (uint16_t)maxSnapshots &&
+                exitJumpCount[complete] < MAX_EXITS_PER_SNAP)
+                exitJumpArr[complete][exitJumpCount[complete]++] = done;
+            break;
+        }
+
+        case IR_RANGE_SUM_BULK: {
+            uint16_t iterId = n->op1;
+            uint16_t sumId = n->op2;
+            uint16_t limitId = n->imm.arith.limit;
+            uint16_t fallback = n->imm.arith.fallback;
+            uint16_t complete = n->imm.arith.snapshot;
+            int irg, im; sljit_sw io;
+            int lrg, lm; sljit_sw lo;
+            int srg, sm; sljit_sw so;
+            getFP(ra, iterId, &irg, &im, &io);
+            getFP(ra, limitId, &lrg, &lm, &lo);
+            getFP(ra, sumId, &srg, &sm, &so);
+
+            struct sljit_jump* bad[7];
+            sljit_emit_fop1(C, SLJIT_CONV_SW_FROM_F64,
+                            SLJIT_R0, 0, irg, io);
+            sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW,
+                            SLJIT_FR0, 0, SLJIT_R0, 0);
+            bad[0] = sljit_emit_fcmp(C, SLJIT_UNORDERED_OR_NOT_EQUAL,
+                                     irg, io, SLJIT_FR0, 0);
+            sljit_emit_fop1(C, SLJIT_CONV_SW_FROM_F64,
+                            SLJIT_R0, 0, lrg, lo);
+            sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW,
+                            SLJIT_FR0, 0, SLJIT_R0, 0);
+            bad[1] = sljit_emit_fcmp(C, SLJIT_UNORDERED_OR_NOT_EQUAL,
+                                     lrg, lo, SLJIT_FR0, 0);
+            sljit_emit_fop1(C, SLJIT_CONV_SW_FROM_F64,
+                            SLJIT_R0, 0, srg, so);
+            sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW,
+                            SLJIT_FR0, 0, SLJIT_R0, 0);
+            bad[2] = sljit_emit_fcmp(C, SLJIT_UNORDERED_OR_NOT_EQUAL,
+                                     srg, so, SLJIT_FR0, 0);
+
+            union { double d; sljit_sw w; } bits;
+            bits.d = 0.0;
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           SLJIT_IMM, bits.w);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff,
+                           SLJIT_R0, 0);
+            bad[3] = sljit_emit_fcmp(C, SLJIT_UNORDERED_OR_LESS,
+                                     irg, io, SLJIT_MEM1(SLJIT_SP), tmpOff);
+            bad[4] = sljit_emit_fcmp(C, SLJIT_UNORDERED_OR_LESS,
+                                     lrg, lo, irg, io);
+            bad[5] = sljit_emit_fcmp(C, SLJIT_UNORDERED_OR_LESS,
+                                     srg, so, SLJIT_MEM1(SLJIT_SP), tmpOff);
+
+            // remaining sum = (limit - iter) * (iter + limit + 1) / 2
+            sljit_emit_fop2(C, SLJIT_SUB_F64, SLJIT_FR0, 0,
+                            lrg, lo, irg, io);
+            sljit_emit_fop2(C, SLJIT_ADD_F64, SLJIT_FR1, 0,
+                            irg, io, lrg, lo);
+            bits.d = 1.0;
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           SLJIT_IMM, bits.w);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff,
+                           SLJIT_R0, 0);
+            sljit_emit_fop2(C, SLJIT_ADD_F64, SLJIT_FR1, 0,
+                            SLJIT_FR1, 0, SLJIT_MEM1(SLJIT_SP), tmpOff);
+            sljit_emit_fop2(C, SLJIT_MUL_F64, SLJIT_FR0, 0,
+                            SLJIT_FR0, 0, SLJIT_FR1, 0);
+            bits.d = 0.5;
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           SLJIT_IMM, bits.w);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff,
+                           SLJIT_R0, 0);
+            sljit_emit_fop2(C, SLJIT_MUL_F64, SLJIT_FR0, 0,
+                            SLJIT_FR0, 0, SLJIT_MEM1(SLJIT_SP), tmpOff);
+            sljit_emit_fop2(C, SLJIT_ADD_F64, SLJIT_FR0, 0,
+                            SLJIT_FR0, 0, srg, so);
+
+            bits.d = (double)(1LL << 53);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           SLJIT_IMM, bits.w);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff,
+                           SLJIT_R0, 0);
+            bad[6] = sljit_emit_fcmp(C, SLJIT_UNORDERED_OR_GREATER,
+                                     SLJIT_FR0, 0,
+                                     SLJIT_MEM1(SLJIT_SP), tmpOff);
+            for (int ck = 0; ck < 7; ck++) {
+                if (fallback < (uint16_t)maxSnapshots &&
+                    exitJumpCount[fallback] < MAX_EXITS_PER_SNAP)
+                    exitJumpArr[fallback][exitJumpCount[fallback]++] = bad[ck];
+            }
+
+            if (sm) {
+                sljit_emit_fop1(C, SLJIT_MOV_F64, srg, so, SLJIT_FR0, 0);
+            } else {
+                sljit_emit_fop1(C, SLJIT_MOV_F64, srg, 0, SLJIT_FR0, 0);
+            }
+            struct sljit_jump* done = sljit_emit_jump(C, SLJIT_JUMP);
+            if (complete < (uint16_t)maxSnapshots &&
+                exitJumpCount[complete] < MAX_EXITS_PER_SNAP)
+                exitJumpArr[complete][exitJumpCount[complete]++] = done;
+            break;
+        }
+
         // ----- Control flow -----
         case IR_LOOP_HEADER: {
             // Validate pre-header integer conversions only after every
@@ -1112,6 +1433,7 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                 const IRNode* phi = &ir->nodes[p];
                 if ((phi->flags & IR_FLAG_DEAD) || phi->op != IR_PHI) continue;
                 if (phi->op2 == IR_NONE || phi->op2 >= ir->count) continue;
+                if (backedgeToPhi[phi->op2] == phi->id) continue;
                 if (phi->type == IR_TYPE_NUM) {
                     int srcReg, srcMem; sljit_sw srcOff;
                     int dstReg, dstMem; sljit_sw dstOff;
@@ -1490,6 +1812,7 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                 entry->ssa_ref >= ir->count) continue;
 
             uint16_t ref = entry->ssa_ref;
+            if (backedgeToPhi[ref] != IR_NONE) ref = backedgeToPhi[ref];
             IRType type = ir->nodes[ref].type;
             sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
                            SLJIT_IMM, (sljit_sw)(uintptr_t)entry->address);
