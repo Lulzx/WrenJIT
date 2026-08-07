@@ -309,6 +309,25 @@ TEST(test_dce_chain) {
     assert(buf.nodes[c].flags & IR_FLAG_DEAD);
 }
 
+TEST(test_register_pressure_spills_safely) {
+    IRBuffer buf;
+    irBufferInit(&buf);
+    uint16_t values[96];
+    for (int i = 0; i < 96; i++) values[i] = irEmitConst(&buf, (double)i);
+    uint16_t sum = values[0];
+    for (int i = 1; i < 96; i++)
+        sum = irEmit(&buf, IR_ADD, sum, values[i], IR_TYPE_NUM);
+    irEmitStore(&buf, 0, irEmitBox(&buf, sum));
+
+    RegAllocState ra;
+    regAllocInit(&ra, buf.count);
+    regAllocComputeRanges(&ra, &buf);
+    regAllocRun(&ra);
+    assert(ra.max_spill_slots > 0);
+    assert(ra.max_spill_slots <= MAX_SPILL_SLOTS);
+    regAllocFree(&ra);
+}
+
 TEST(test_unsupported_codegen_ops_are_rejected) {
     const IROp unsupported[] = { IR_MOD, IR_CALL_C, IR_CALL_WREN };
     for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
@@ -458,6 +477,7 @@ int main(void) {
     RUN(test_const_fold_mul);
     RUN(test_dce);
     RUN(test_dce_chain);
+    RUN(test_register_pressure_spills_safely);
     RUN(test_unsupported_codegen_ops_are_rejected);
     RUN(test_loop_ir);
     RUN(test_phi);
