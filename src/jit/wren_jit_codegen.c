@@ -30,6 +30,9 @@
 // one compiler/ABI's padding.
 #define OBJ_CLASS_OFFSET ((sljit_sw)offsetof(Obj, classObj))
 #define OBJ_FIELDS_OFFSET ((sljit_sw)offsetof(ObjInstance, fields))
+#define RANGE_FROM_OFFSET ((sljit_sw)offsetof(ObjRange, from))
+#define RANGE_TO_OFFSET ((sljit_sw)offsetof(ObjRange, to))
+#define RANGE_INCLUSIVE_OFFSET ((sljit_sw)offsetof(ObjRange, isInclusive))
 
 // Maximum native jumps targeting one deoptimization snapshot. Code generation
 // preflights this bound instead of silently dropping an additional guard.
@@ -1258,6 +1261,52 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             // fmod or implement integer mod. For now, use a C call.
             // Simplified: emit as remainder of integer division.
             // TODO: implement properly via C callback or SLJIT div+mul+sub.
+            break;
+        }
+
+        case IR_LOAD_RANGE: {
+            // Read one shape field out of an ObjRange as a raw double. The
+            // receiver has already been proven to be a Range by a preceding
+            // IR_GUARD_CLASS, so the unmasked pointer is safe to dereference.
+            uint16_t objId = n->op1;
+            if (objId == IR_NONE) break;
+
+            int objReg, objMem; sljit_sw objOff;
+            getGP(ra, objId, &objReg, &objMem, &objOff);
+
+            // R1 = boxed range Value.
+            if (objMem) {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, objReg, objOff);
+            } else {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, objReg, 0);
+            }
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R1, 0, SLJIT_R1, 0,
+                           SLJIT_IMM, (sljit_sw)~(WREN_SIGN_BIT | WREN_QNAN));
+
+            int dstReg, dstMem; sljit_sw dstOff;
+            getFP(ra, n->id, &dstReg, &dstMem, &dstOff);
+            int fpDst = dstMem ? SLJIT_FR0 : dstReg;
+
+            if (n->imm.mem.field == (uint16_t)IR_RANGE_INCLUSIVE) {
+                // isInclusive is a C bool; widen the byte and convert so the
+                // result is a plain 0.0/1.0 double like the other two fields.
+                sljit_emit_op1(C, SLJIT_MOV_U8, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_R1),
+                               (sljit_sw)RANGE_INCLUSIVE_OFFSET);
+                sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW, fpDst, 0,
+                                SLJIT_R0, 0);
+            } else {
+                sljit_sw off = (n->imm.mem.field == (uint16_t)IR_RANGE_FROM)
+                                   ? RANGE_FROM_OFFSET
+                                   : RANGE_TO_OFFSET;
+                sljit_emit_fop1(C, SLJIT_MOV_F64, fpDst, 0,
+                                SLJIT_MEM1(SLJIT_R1), off);
+            }
+
+            if (dstMem) {
+                sljit_emit_fop1(C, SLJIT_MOV_F64, dstReg, dstOff,
+                                SLJIT_FR0, 0);
+            }
             break;
         }
 

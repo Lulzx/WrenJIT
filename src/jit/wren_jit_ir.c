@@ -86,6 +86,13 @@ uint16_t irEmitLoadField(IRBuffer* buf, uint16_t obj, uint16_t field)
     return id;
 }
 
+uint16_t irEmitLoadRange(IRBuffer* buf, uint16_t obj, IRRangeField field)
+{
+    uint16_t id = irEmit(buf, IR_LOAD_RANGE, obj, IR_NONE, IR_TYPE_NUM);
+    buf->nodes[id].imm.mem.field = (uint16_t)field;
+    return id;
+}
+
 uint16_t irEmitStoreField(IRBuffer* buf, uint16_t obj, uint16_t field,
                           uint16_t val)
 {
@@ -253,6 +260,7 @@ const char* irOpName(IROp op)
     case IR_STORE_STACK:    return "STORE_STACK";
     case IR_LOAD_FIELD:     return "LOAD_FIELD";
     case IR_STORE_FIELD:    return "STORE_FIELD";
+    case IR_LOAD_RANGE:     return "LOAD_RANGE";
     case IR_LOAD_MODULE_VAR:  return "LOAD_MODULE_VAR";
     case IR_STORE_MODULE_VAR: return "STORE_MODULE_VAR";
     case IR_BOX_NUM:        return "BOX_NUM";

@@ -686,6 +686,11 @@ void irOptLICM(IRBuffer* buf)
             // field load changes its SSA id and can invalidate the register
             // lifetime expected by field consumers after LICM compaction.
             if (n->op == IR_LOAD_FIELD) continue;
+            // IR_LOAD_RANGE dereferences its operand, which is only safe after
+            // the GUARD_CLASS proving it is a Range. Guards carry side effects
+            // and so never hoist, and hoisting the load past one would
+            // dereference whatever the slot happens to hold.
+            if (n->op == IR_LOAD_RANGE) continue;
 
             bool invariant = true;
 

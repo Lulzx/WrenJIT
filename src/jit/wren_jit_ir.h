@@ -51,6 +51,7 @@ typedef enum {
     // Field access
     IR_LOAD_FIELD,       // load object field
     IR_STORE_FIELD,      // store object field
+    IR_LOAD_RANGE,       // load an ObjRange shape field as a raw double
 
     // Module variable access
     IR_LOAD_MODULE_VAR,
@@ -89,6 +90,23 @@ typedef enum {
 
     IR_OPCODE_COUNT
 } IROp;
+
+// ---------------------------------------------------------------------------
+// ObjRange shape fields, selected by IR_LOAD_RANGE via imm.mem.field.
+//
+// A trace that inlines Range.iterate cannot bake the range's shape into
+// constants: the same loop PC is reached with different ranges, and the class
+// guard only proves the receiver is *a* Range. These let the trace read the
+// actual range at run time and guard the parts it specialized on.
+//
+// isInclusive is produced as 0.0 or 1.0 rather than an integer so all three
+// reuse the existing FP compare and guard path.
+// ---------------------------------------------------------------------------
+typedef enum {
+    IR_RANGE_FROM = 0,
+    IR_RANGE_TO = 1,
+    IR_RANGE_INCLUSIVE = 2,
+} IRRangeField;
 
 // ---------------------------------------------------------------------------
 // IR types
@@ -209,6 +227,7 @@ uint16_t irEmitStore(IRBuffer* buf, uint16_t slot, uint16_t val);
 uint16_t irEmitLoadField(IRBuffer* buf, uint16_t obj, uint16_t field);
 uint16_t irEmitStoreField(IRBuffer* buf, uint16_t obj, uint16_t field,
                           uint16_t val);
+uint16_t irEmitLoadRange(IRBuffer* buf, uint16_t obj, IRRangeField field);
 
 uint16_t irEmitGuardNum(IRBuffer* buf, uint16_t val, uint16_t snapshot);
 uint16_t irEmitGuardClass(IRBuffer* buf, uint16_t val, void* classPtr,

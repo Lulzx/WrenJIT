@@ -338,6 +338,38 @@ TEST(test_fractional_loop_values_stay_double) {
     wrenFreeVM(vm);
 }
 
+// One loop PC is reached with many different ranges, and the receiver guard
+// only proves the receiver is a Range. A trace that baked the recorded range's
+// bounds, direction or inclusivity into constants reused them for every later
+// range: a shorter range overran its end, an exclusive range overshot by one,
+// and a reversed range stepped away from its limit and never terminated.
+TEST(test_range_trace_reused_across_shapes) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "class T {\n"
+        "  static count(r) {\n"
+        "    var n = 0\n"
+        "    for (x in r) { n = n + 1 }\n"
+        "    return n\n"
+        "  }\n"
+        "}\n"
+        // Compiles a trace for an ascending, inclusive range of 100.
+        "var warm = T.count(1..100)\n"
+        // Shorter bound: must not run on to the recorded limit.
+        "var shorter = T.count(1..60)\n"
+        // Longer bound: must not stop at the recorded limit.
+        "var longer = T.count(1..200)\n"
+        // Exclusive: must not include the endpoint.
+        "var exclusive = T.count(1...100)\n"
+        // Descending: baking step=+1 here spins forever.
+        "var descending = T.count(100..1)\n"
+        "System.print(\"%(warm),%(shorter),%(longer),%(exclusive),%(descending)\")\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "100,60,200,99,100") != NULL);
+    wrenFreeVM(vm);
+}
+
 TEST(test_range_loop_stack_promotion) {
     resetOutput();
     WrenVM* vm = createVM();
@@ -398,6 +430,7 @@ int main(void) {
     RUN(test_call0_boolean_toggler_inline);
     RUN(test_call0_toggler_returning_this_inline);
     RUN(test_fractional_loop_values_stay_double);
+    RUN(test_range_trace_reused_across_shapes);
     RUN(test_range_loop_stack_promotion);
     RUN(test_integer_comparison_specialization);
     RUN(test_huge_loop_value_stays_double);

@@ -81,14 +81,42 @@ static bool inlineRangeIterate(JitRecorder* r, WrenVM* vm,
 
     ObjRange* range = AS_RANGE(recv_val);
 
-    // Determine iteration direction and step at trace time.
+    // Direction and inclusivity select which instructions this trace emits, so
+    // they have to be fixed at record time. The range's bounds do not: baking
+    // them would be wrong, because one loop PC is reached with many different
+    // ranges and the class guard only proves the receiver is *a* Range. So the
+    // limit is read from the range at run time, and the two structural facts
+    // get guards that side-exit when a differently shaped range shows up.
     bool ascending  = (range->from <= range->to);
     bool inclusive  = range->isInclusive;
     double step     = ascending ? 1.0 : -1.0;
-    double limit    = range->to;
 
     // Guard: arg is Num (the iterator is always a number in a hot loop).
     irEmitGuardNum(&r->ir, arg_ssa, snap);
+
+    uint16_t from_ssa = irEmitLoadRange(&r->ir, recv_ssa, IR_RANGE_FROM);
+    uint16_t to_ssa   = irEmitLoadRange(&r->ir, recv_ssa, IR_RANGE_TO);
+    uint16_t incl_ssa = irEmitLoadRange(&r->ir, recv_ssa, IR_RANGE_INCLUSIVE);
+
+    // Guard direction: (from <= to) must still match what was recorded,
+    // otherwise the baked step would run away from the limit and never exit.
+    uint16_t dir_cmp = irEmit(&r->ir, IR_LTE, from_ssa, to_ssa, IR_TYPE_BOOL);
+    uint16_t dir_boxed = irEmit(&r->ir, IR_BOX_BOOL, dir_cmp, IR_NONE,
+                                IR_TYPE_VALUE);
+    if (ascending) {
+        irEmitGuardTrue(&r->ir, dir_boxed, snap);
+    } else {
+        irEmitGuardFalse(&r->ir, dir_boxed, snap);
+    }
+
+    // Guard inclusivity: it picks < versus <=, so an exclusive range running a
+    // trace recorded as inclusive would overshoot by one element.
+    uint16_t incl_expected = irEmitConst(&r->ir, inclusive ? 1.0 : 0.0);
+    uint16_t incl_cmp = irEmit(&r->ir, IR_EQ, incl_ssa, incl_expected,
+                               IR_TYPE_BOOL);
+    uint16_t incl_boxed = irEmit(&r->ir, IR_BOX_BOOL, incl_cmp, IR_NONE,
+                                 IR_TYPE_VALUE);
+    irEmitGuardTrue(&r->ir, incl_boxed, snap);
 
     // Unbox current iterator.
     uint16_t iter_fp = irEmitUnbox(&r->ir, arg_ssa);
@@ -97,15 +125,14 @@ static bool inlineRangeIterate(JitRecorder* r, WrenVM* vm,
     uint16_t step_ssa    = irEmitConst(&r->ir, step);
     uint16_t new_iter    = irEmit(&r->ir, IR_ADD, iter_fp, step_ssa, IR_TYPE_NUM);
 
-    // Emit bound guard.
+    // Emit bound guard against the range's actual `to`.
     // Ascending  + inclusive:  exit when new_iter >  to → guard new_iter <= to
     // Ascending  + exclusive:  exit when new_iter >= to → guard new_iter <  to
     // Descending + inclusive:  exit when new_iter <  to → guard new_iter >= to
     // Descending + exclusive:  exit when new_iter <= to → guard new_iter >  to
-    uint16_t limit_ssa = irEmitConst(&r->ir, limit);
     IROp cmp_op = ascending ? (inclusive ? IR_LTE : IR_LT)
                             : (inclusive ? IR_GTE : IR_GT);
-    uint16_t cmp_result  = irEmit(&r->ir, cmp_op, new_iter, limit_ssa, IR_TYPE_BOOL);
+    uint16_t cmp_result  = irEmit(&r->ir, cmp_op, new_iter, to_ssa, IR_TYPE_BOOL);
     uint16_t boxed_cmp   = irEmit(&r->ir, IR_BOX_BOOL, cmp_result, IR_NONE,
                                   IR_TYPE_VALUE);
     irEmitGuardTrue(&r->ir, boxed_cmp, snap);
