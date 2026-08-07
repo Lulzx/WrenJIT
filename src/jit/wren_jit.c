@@ -16,6 +16,19 @@
 #include <string.h>
 #include <stdio.h>
 
+static bool jitDebugEnabled(void)
+{
+    const char* value = getenv("WREN_JIT_DEBUG");
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+#define JIT_DEBUG_LOG(...)                           \
+    do {                                            \
+        if (jitDebugEnabled()) {                    \
+            fprintf(stderr, __VA_ARGS__);           \
+        }                                           \
+    } while (0)
+
 // Hash function for PC-keyed open-addressing table.
 static uint32_t hash_pc(uint8_t* pc)
 {
@@ -286,27 +299,27 @@ JitTrace* wrenJitCompileAndStore(WrenVM* vm, WrenJitState* jit,
     }
 
     // Run optimizer.
-    fprintf(stderr, "[JIT] DEBUG: before irOptimize, count=%u\n", ir->count);
+    JIT_DEBUG_LOG("[JIT] DEBUG: before irOptimize, count=%u\n", ir->count);
     irOptimize(ir);
-    fprintf(stderr, "[JIT] DEBUG: after irOptimize, count=%u\n", ir->count);
+    JIT_DEBUG_LOG("[JIT] DEBUG: after irOptimize, count=%u\n", ir->count);
 
     // Register allocation.
     RegAllocState ra;
-    fprintf(stderr, "[JIT] DEBUG: regAllocInit\n");
+    JIT_DEBUG_LOG("[JIT] DEBUG: regAllocInit\n");
     regAllocInit(&ra, (int)ir->count);
-    fprintf(stderr, "[JIT] DEBUG: regAllocComputeRanges\n");
+    JIT_DEBUG_LOG("[JIT] DEBUG: regAllocComputeRanges\n");
     regAllocComputeRanges(&ra, ir);
-    fprintf(stderr, "[JIT] DEBUG: regAllocRun\n");
+    JIT_DEBUG_LOG("[JIT] DEBUG: regAllocRun\n");
     regAllocRun(&ra);
-    fprintf(stderr, "[JIT] DEBUG: regAlloc done, ranges=%d\n", ra.num_ranges);
+    JIT_DEBUG_LOG("[JIT] DEBUG: regAlloc done, ranges=%d\n", ra.num_ranges);
 
     // Dump IR if requested.
     if (getenv("WREN_JIT_DUMP_IR")) irBufferDump(ir);
 
     // Code generation.  (ir is part of the recorder struct, not heap-allocated.)
-    fprintf(stderr, "[JIT] DEBUG: wrenJitCodegen start\n");
+    JIT_DEBUG_LOG("[JIT] DEBUG: wrenJitCodegen start\n");
     JitTrace* trace = wrenJitCodegen(vm, ir, &ra, jit->anchor_pc, modVarsBase);
-    fprintf(stderr, "[JIT] DEBUG: wrenJitCodegen done, trace=%p\n", (void*)trace);
+    JIT_DEBUG_LOG("[JIT] DEBUG: wrenJitCodegen done, trace=%p\n", (void*)trace);
     regAllocFree(&ra);
 
     if (!trace) {

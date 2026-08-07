@@ -143,6 +143,12 @@ cmake -B build -DWREN_JIT=OFF
 ./build/wrenjit_cli script.wren --no-jit
 ```
 
+Enable compiler-path debug logs only when needed:
+
+```sh
+WREN_JIT_DEBUG=1 ./build/wrenjit_cli script.wren --jit
+```
+
 ## Limitations
 
 - Range-based `for` loops compile via monomorphic inlining; other object method
