@@ -285,6 +285,16 @@ TEST(test_call0_boolean_toggler_inline) {
     assert(result == WREN_RESULT_SUCCESS);
     assert(strstr(output_buf, "false") != NULL);
     assert(vm->jit->traces_compiled == 1);
+    bool hasTraceRoot = false;
+    for (uint32_t i = 0; i < vm->jit->trace_capacity; i++) {
+        JitTrace* trace = &vm->jit->traces[i];
+        if (trace->anchor_pc != NULL && trace->num_gc_roots > 0) {
+            hasTraceRoot = true;
+            break;
+        }
+    }
+    assert(hasTraceRoot);
+    wrenCollectGarbage(vm); // Native embedded pointers participate in marking.
     wrenFreeVM(vm);
 }
 

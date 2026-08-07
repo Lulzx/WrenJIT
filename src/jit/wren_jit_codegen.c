@@ -1560,23 +1560,26 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
         }
     }
 
-    // Collect GC roots: object pointers embedded in the trace (from IR_CONST_OBJ).
+    // Collect every GC object pointer embedded in native code. Class guards
+    // contain ObjClass pointers just as constants contain Obj pointers.
     int numRoots = 0;
     for (uint16_t i = 0; i < ir->count; i++) {
-        if (ir->nodes[i].op == IR_CONST_OBJ && ir->nodes[i].imm.ptr != NULL)
-            numRoots++;
+        IROp op = ir->nodes[i].op;
+        if ((op == IR_CONST_OBJ || op == IR_GUARD_CLASS) &&
+            ir->nodes[i].imm.ptr != NULL) numRoots++;
     }
     if (numRoots > 0) {
         trace->gc_roots = (void**)calloc((size_t)numRoots, sizeof(void*));
         if (trace->gc_roots) {
             int idx = 0;
             for (uint16_t i = 0; i < ir->count; i++) {
-                if (ir->nodes[i].op == IR_CONST_OBJ && ir->nodes[i].imm.ptr != NULL) {
+                IROp op = ir->nodes[i].op;
+                if ((op == IR_CONST_OBJ || op == IR_GUARD_CLASS) &&
+                    ir->nodes[i].imm.ptr != NULL)
                     trace->gc_roots[idx++] = ir->nodes[i].imm.ptr;
-                }
             }
+            trace->num_gc_roots = (uint16_t)idx;
         }
-        trace->num_gc_roots = (uint16_t)numRoots;
     }
 
     trace->exec_count = 0;

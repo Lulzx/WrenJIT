@@ -251,20 +251,15 @@ void wrenJitStoreTrace(WrenJitState* jit, JitTrace* trace)
 
 void wrenJitMarkRoots(WrenVM* vm, WrenJitState* jit)
 {
-    (void)vm;
-    if (jit == NULL || jit->traces == NULL) return;
+    if (vm == NULL || jit == NULL || jit->traces == NULL) return;
 
     for (uint32_t i = 0; i < jit->trace_capacity; i++) {
         JitTrace* t = &jit->traces[i];
-        if (t->anchor_pc == NULL) continue;
-
-        // Each gc_root should be marked via wrenGrayObj(vm, root).
-        // Since we don't have the Wren GC header here yet, this is a
-        // placeholder that iterates the roots. The actual call will be:
-        //   for (int j = 0; j < t->num_gc_roots; j++) {
-        //       wrenGrayObj(vm, (Obj*)t->gc_roots[j]);
-        //   }
-        (void)t;
+        if (t->anchor_pc == NULL || t->gc_roots == NULL) continue;
+        for (uint16_t j = 0; j < t->num_gc_roots; j++) {
+            if (t->gc_roots[j] != NULL)
+                wrenGrayObj(vm, (Obj*)t->gc_roots[j]);
+        }
     }
 }
 

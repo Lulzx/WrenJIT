@@ -40,7 +40,7 @@ index 2ca0cfd..001f794 100644
  
  // An instance of a first-class function and the environment it has closed over.
 diff --git a/src/vm/wren_vm.c b/src/vm/wren_vm.c
-index f63ab8c..2acf2f7 100644
+index f63ab8c..dfd8b07 100644
 --- a/src/vm/wren_vm.c
 +++ b/src/vm/wren_vm.c
 @@ -16,6 +16,11 @@
@@ -82,7 +82,20 @@ index f63ab8c..2acf2f7 100644
    DEALLOCATE(vm, vm);
  }
  
-@@ -887,6 +905,28 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -168,6 +186,12 @@ void wrenCollectGarbage(WrenVM* vm)
+   // Method names.
+   wrenBlackenSymbolTable(vm, &vm->methodNames);
+ 
++#ifdef WREN_JIT
++  // Native traces embed object/class pointers that are not visible from the
++  // interpreter stack. Keep those objects alive for as long as the trace is.
++  wrenJitMarkRoots(vm, vm->jit);
++#endif
++
+   // Now that we have grayed the roots, do a depth-first search over all of the
+   // reachable objects.
+   wrenBlackenObjects(vm);
+@@ -887,6 +911,28 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
      #define DEBUG_TRACE_INSTRUCTIONS() do { } while (false)
    #endif
  
@@ -111,7 +124,7 @@ index f63ab8c..2acf2f7 100644
    #if WREN_COMPUTED_GOTO
  
    static void* dispatchTable[] = {
-@@ -902,6 +942,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -902,6 +948,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
        do                                                                       \
        {                                                                        \
          DEBUG_TRACE_INSTRUCTIONS();                                            \
@@ -119,7 +132,7 @@ index f63ab8c..2acf2f7 100644
          goto *dispatchTable[instruction = (Code)READ_BYTE()];                  \
        } while (false)
  
-@@ -910,6 +951,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -910,6 +957,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
    #define INTERPRET_LOOP                                                       \
        loop:                                                                    \
          DEBUG_TRACE_INSTRUCTIONS();                                            \
@@ -127,7 +140,7 @@ index f63ab8c..2acf2f7 100644
          switch (instruction = (Code)READ_BYTE())
  
    #define CASE_CODE(name)  case CODE_##name
-@@ -1158,6 +1200,62 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -1158,6 +1206,62 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
        // Jump back to the top of the loop.
        uint16_t offset = READ_SHORT();
        ip -= offset;
