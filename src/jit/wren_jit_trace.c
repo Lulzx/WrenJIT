@@ -1214,9 +1214,22 @@ bool jitRecorderStep(WrenJitState* jit, WrenVM* vm, uint8_t* ip)
         // terminating backedge of a short inner loop and execution has
         // now reached an enclosing loop. Do not permanently blacklist the
         // inner loop: retry at its next backedge, which will enter the
-        // body and close a trace normally.
+        // body and close a trace normally. Bound the retries so a loop
+        // that never reaches a clean entry (e.g. a body skipped on the
+        // hot path) cannot re-arm its counter forever.
         if ((uintptr_t)target < (uintptr_t)r->anchor_pc &&
             jit->active_hot_count != NULL) {
+            if (jit->loop_retry_anchor != jit->anchor_pc) {
+                jit->loop_retry_anchor = jit->anchor_pc;
+                jit->loop_retry_count = 1;
+            } else {
+                jit->loop_retry_count++;
+            }
+            if (jit->loop_retry_count > JIT_MAX_LOOP_RETRIES) {
+                jit->active_hot_count = NULL;
+                jitRecorderAbort(jit, "loop completion retry exhausted");
+                return false;
+            }
             uint16_t* retry = jit->active_hot_count;
             jit->active_hot_count = NULL;
             jitRecorderAbort(jit, "recording started at loop completion");

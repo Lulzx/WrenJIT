@@ -581,6 +581,9 @@ JitTrace* wrenJitCompileAndStore(WrenVM* vm, WrenJitState* jit,
 
     trace->anchor_pc = jit->anchor_pc;
     jit->active_hot_count = NULL;
+    // A successful compile clears the retry budget for this anchor.
+    jit->loop_retry_anchor = NULL;
+    jit->loop_retry_count = 0;
     wrenJitStoreTrace(jit, trace);
     return trace;
 }

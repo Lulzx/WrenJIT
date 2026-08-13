@@ -40,6 +40,12 @@ typedef struct sObjClass ObjClass;
 #define JIT_RE_RECORD_HANDOFF_EXITS 100
 #define JIT_MAX_RE_RECORDS 8
 
+// Recording that starts on an inner loop's terminating back-edge ("recording
+// started at loop completion") re-arms the hot counter to retry at a fresh
+// entry. A loop that never reaches a clean entry would otherwise re-record
+// forever; give up after this many consecutive retries of the same anchor.
+#define JIT_MAX_LOOP_RETRIES 16
+
 // Trace execution function type
 // Returns 0 on success, or exit index (1-based) on side exit
 // Args: vm, fiber, stackStart, moduleVarsData (Value* to module variables array)
@@ -126,6 +132,14 @@ typedef struct WrenJitState {
     uint64_t traces_aborted;
     uint64_t total_exits;
     uint32_t re_records_done;   // degenerate traces retired for re-recording
+
+    // Bounded "recording started at loop completion" retries. Recording that
+    // begins on an inner loop's terminating back-edge aborts and re-arms the
+    // hot counter to try again at a fresh entry; without a bound, a loop that
+    // never reaches a clean entry would re-record forever (an exit storm).
+    // Track the last retried anchor and give up after a handful of attempts.
+    uint8_t* loop_retry_anchor;
+    uint8_t loop_retry_count;
 
     // Debug (temporary): LIST_LOAD instrumentation cells written by generated
     // code and read back on side exit.
