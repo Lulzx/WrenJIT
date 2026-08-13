@@ -691,6 +691,30 @@ TEST(test_huge_loop_value_stays_double) {
     wrenFreeVM(vm);
 }
 
+TEST(test_short_inner_loop_records_after_retry) {
+    // Recording that starts on a short inner loop's terminating back-edge
+    // aborts once ("recording started at loop completion"), re-arms the hot
+    // counter, and records on the next fresh entry. The retry must be bounded
+    // and the loop must still produce the correct result.
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var total = 0\n"
+        "var i = 0\n"
+        "while (i < 20000) {\n"
+        "  var j = 0\n"
+        "  while (j < 1) { j = j + 1 }\n"
+        "  total = total + i\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(total)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "199990000") != NULL);
+    assert(vm->jit->traces_compiled >= 1);
+    assert(vm->jit->traces_aborted <= 4);
+    wrenFreeVM(vm);
+}
+
 TEST(test_snapshot_only_number_materializes_on_exit) {
     resetOutput();
     WrenVM* vm = createVM();
@@ -768,6 +792,7 @@ int main(void) {
     RUN(test_range_loop_stack_promotion);
     RUN(test_integer_comparison_specialization);
     RUN(test_huge_loop_value_stays_double);
+    RUN(test_short_inner_loop_records_after_retry);
     RUN(test_snapshot_only_number_materializes_on_exit);
     RUN(test_recursive_numeric_kernel);
     RUN(test_recursive_tree_kernels);
