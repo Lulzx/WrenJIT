@@ -107,6 +107,20 @@ python3 bench/run_benchmarks.py \
 python3 bench/gen_report.py bench/results.json --output docs/index.html
 ```
 
+Run the ten-program [Computer Language Benchmarks Game](https://benchmarksgame-team.pages.debian.net/benchmarksgame/) comparison:
+
+```sh
+python3 bench/run_benchmarks.py \
+  --suite benchmarksgame --binary ./build/wrenjit_cli \
+  --modes both --luajit luajit --trials 5
+```
+
+These are paired, scaled local ports rather than submissions measured by the
+Benchmarks Game host. Output-heavy programs emit checksums so terminal speed
+does not dominate. Since Wren has no regex or bignum module, regex-redux uses
+the same explicit mask matcher in both languages and pidigits uses the same
+array spigot in both languages.
+
 ## Layout
 
 ```text

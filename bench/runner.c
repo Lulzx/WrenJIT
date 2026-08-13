@@ -115,6 +115,18 @@ int main(int argc, char* argv[]) {
                 (unsigned long long)vm->jit->traces_compiled,
                 (unsigned long long)vm->jit->traces_aborted,
                 (unsigned long long)vm->jit->total_exits);
+        if (getenv("WREN_JIT_TRACE_STATS")) {
+            for (uint32_t i = 0; i < vm->jit->trace_capacity; i++) {
+                JitTrace* t = &vm->jit->traces[i];
+                if (t->code != NULL) {
+                    fprintf(stderr, "  trace#%u exec=%llu exits=%llu loop_exit=%d loop_exit2=%d anchoridx=%ld\n",
+                            i, (unsigned long long)t->exec_count,
+                            (unsigned long long)t->exit_count,
+                            (int)t->loop_exit_snapshot, (int)t->loop_exit_snapshot2,
+                            (long)(uintptr_t)t->anchor_pc);
+                }
+            }
+        }
     }
 #endif
 

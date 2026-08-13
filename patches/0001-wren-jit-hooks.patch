@@ -28,8 +28,79 @@ index 47705f5..74432b9 100644
    #endif
  
    return compiler->fn;
+diff --git a/src/vm/wren_core.c b/src/vm/wren_core.c
+index d0a121f..a231311 100644
+--- a/src/vm/wren_core.c
++++ b/src/vm/wren_core.c
+@@ -1218,6 +1218,32 @@ DEF_PRIMITIVE(system_writeString)
+   RETURN_VAL(args[1]);
+ }
+ 
++uint8_t wrenPrimitiveFastKind(Primitive primitive)
++{
++  if (primitive == prim_num_plus) return PRIMITIVE_FAST_NUM_PLUS;
++  if (primitive == prim_num_minus) return PRIMITIVE_FAST_NUM_MINUS;
++  if (primitive == prim_num_multiply) return PRIMITIVE_FAST_NUM_MULTIPLY;
++  if (primitive == prim_num_divide) return PRIMITIVE_FAST_NUM_DIVIDE;
++  if (primitive == prim_num_lt) return PRIMITIVE_FAST_NUM_LT;
++  if (primitive == prim_num_gt) return PRIMITIVE_FAST_NUM_GT;
++  if (primitive == prim_num_lte) return PRIMITIVE_FAST_NUM_LTE;
++  if (primitive == prim_num_gte) return PRIMITIVE_FAST_NUM_GTE;
++  if (primitive == prim_num_mod) return PRIMITIVE_FAST_NUM_MOD;
++  if (primitive == prim_num_eqeq) return PRIMITIVE_FAST_NUM_EQ;
++  if (primitive == prim_num_bangeq) return PRIMITIVE_FAST_NUM_NEQ;
++  if (primitive == prim_num_floor) return PRIMITIVE_FAST_NUM_FLOOR;
++  if (primitive == prim_num_sqrt) return PRIMITIVE_FAST_NUM_SQRT;
++  if (primitive == prim_list_count) return PRIMITIVE_FAST_LIST_COUNT;
++  if (primitive == prim_list_subscript) return PRIMITIVE_FAST_LIST_SUBSCRIPT;
++  if (primitive == prim_list_subscriptSetter)
++    return PRIMITIVE_FAST_LIST_SUBSCRIPT_SETTER;
++  if (primitive == prim_map_subscript) return PRIMITIVE_FAST_MAP_SUBSCRIPT;
++  if (primitive == prim_map_subscriptSetter)
++    return PRIMITIVE_FAST_MAP_SUBSCRIPT_SETTER;
++  return PRIMITIVE_FAST_NONE;
++}
++
++
+ // Creates either the Object or Class class in the core module with [name].
+ static ObjClass* defineClass(WrenVM* vm, ObjModule* module, const char* name)
+ {
+diff --git a/src/vm/wren_primitive.h b/src/vm/wren_primitive.h
+index eb55fe8..af9fd60 100644
+--- a/src/vm/wren_primitive.h
++++ b/src/vm/wren_primitive.h
+@@ -3,6 +3,8 @@
+ 
+ #include "wren_vm.h"
+ 
++uint8_t wrenPrimitiveFastKind(Primitive primitive);
++
+ // Binds a primitive method named [name] (in Wren) implemented using C function
+ // [fn] to `ObjClass` [cls].
+ #define PRIMITIVE(cls, name, function)                                         \
+@@ -10,9 +12,10 @@
+     {                                                                          \
+       int symbol = wrenSymbolTableEnsure(vm,                                   \
+           &vm->methodNames, name, strlen(name));                               \
+-      Method method;                                                           \
++      Method method = {0};                                                     \
+       method.type = METHOD_PRIMITIVE;                                          \
+       method.as.primitive = prim_##function;                                   \
++      method.fastKind = wrenPrimitiveFastKind(prim_##function);                \
+       wrenBindMethod(vm, cls, symbol, method);                                 \
+     } while (false)
+ 
+@@ -23,7 +26,7 @@
+     {                                                                          \
+       int symbol = wrenSymbolTableEnsure(vm,                                   \
+           &vm->methodNames, name, strlen(name));                               \
+-      Method method;                                                           \
++      Method method = {0};                                                     \
+       method.type = METHOD_FUNCTION_CALL;                                      \
+       method.as.primitive = prim_##function;                                   \
+       wrenBindMethod(vm, cls, symbol, method);                                 \
 diff --git a/src/vm/wren_value.c b/src/vm/wren_value.c
-index ce29e07..c5b8bd8 100644
+index ce29e07..be258bf 100644
 --- a/src/vm/wren_value.c
 +++ b/src/vm/wren_value.c
 @@ -5,6 +5,9 @@
@@ -42,6 +113,15 @@ index ce29e07..c5b8bd8 100644
  #include "wren_vm.h"
  
  #if WREN_DEBUG_TRACE_MEMORY
+@@ -122,7 +125,7 @@ void wrenBindMethod(WrenVM* vm, ObjClass* classObj, int symbol, Method method)
+   // Make sure the buffer is big enough to contain the symbol's index.
+   if (symbol >= classObj->methods.count)
+   {
+-    Method noMethod;
++    Method noMethod = {0};
+     noMethod.type = METHOD_NONE;
+     wrenMethodBufferFill(vm, &classObj->methods, noMethod,
+                          symbol - classObj->methods.count + 1);
 @@ -257,6 +260,13 @@ ObjFn* wrenNewFunction(WrenVM* vm, ObjModule* module, int maxSlots)
    fn->numUpvalues = 0;
    fn->arity = 0;
@@ -68,7 +148,7 @@ index ce29e07..c5b8bd8 100644
        DEALLOCATE(vm, fn->debug->name);
        DEALLOCATE(vm, fn->debug);
 diff --git a/src/vm/wren_value.h b/src/vm/wren_value.h
-index 2ca0cfd..9c7d62a 100644
+index 2ca0cfd..cbf8b96 100644
 --- a/src/vm/wren_value.h
 +++ b/src/vm/wren_value.h
 @@ -265,6 +265,16 @@ typedef struct
@@ -88,11 +168,52 @@ index 2ca0cfd..9c7d62a 100644
  } ObjFn;
  
  // An instance of a first-class function and the environment it has closed over.
+@@ -373,9 +383,33 @@ typedef enum
+   METHOD_NONE
+ } MethodType;
+ 
++typedef enum
++{
++  PRIMITIVE_FAST_NONE,
++  PRIMITIVE_FAST_NUM_PLUS,
++  PRIMITIVE_FAST_NUM_MINUS,
++  PRIMITIVE_FAST_NUM_MULTIPLY,
++  PRIMITIVE_FAST_NUM_DIVIDE,
++  PRIMITIVE_FAST_NUM_LT,
++  PRIMITIVE_FAST_NUM_GT,
++  PRIMITIVE_FAST_NUM_LTE,
++  PRIMITIVE_FAST_NUM_GTE,
++  PRIMITIVE_FAST_NUM_MOD,
++  PRIMITIVE_FAST_NUM_EQ,
++  PRIMITIVE_FAST_NUM_NEQ,
++  PRIMITIVE_FAST_NUM_FLOOR,
++  PRIMITIVE_FAST_NUM_SQRT,
++  PRIMITIVE_FAST_LIST_COUNT,
++  PRIMITIVE_FAST_LIST_SUBSCRIPT,
++  PRIMITIVE_FAST_LIST_SUBSCRIPT_SETTER,
++  PRIMITIVE_FAST_MAP_SUBSCRIPT,
++  PRIMITIVE_FAST_MAP_SUBSCRIPT_SETTER
++} PrimitiveFastKind;
++
+ typedef struct
+ {
+   MethodType type;
++  uint8_t fastKind;
+ 
+   // The method function itself. The [type] determines which field of the union
+   // is used.
 diff --git a/src/vm/wren_vm.c b/src/vm/wren_vm.c
-index f63ab8c..c0f4c4a 100644
+index f63ab8c..48dfef1 100644
 --- a/src/vm/wren_vm.c
 +++ b/src/vm/wren_vm.c
-@@ -16,6 +16,13 @@
+@@ -1,5 +1,6 @@
+ #include <stdarg.h>
+ #include <string.h>
++#include <math.h>
+ 
+ #include "wren.h"
+ #include "wren_common.h"
+@@ -16,6 +17,13 @@
    #include "wren_opt_random.h"
  #endif
  
@@ -106,7 +227,7 @@ index f63ab8c..c0f4c4a 100644
  #if WREN_DEBUG_TRACE_MEMORY || WREN_DEBUG_TRACE_GC
    #include <time.h>
    #include <stdio.h>
-@@ -93,6 +100,11 @@ WrenVM* wrenNewVM(WrenConfiguration* config)
+@@ -93,6 +101,11 @@ WrenVM* wrenNewVM(WrenConfiguration* config)
  
    vm->modules = wrenNewMap(vm);
    wrenInitializeCore(vm);
@@ -118,7 +239,7 @@ index f63ab8c..c0f4c4a 100644
    return vm;
  }
  
-@@ -119,6 +131,14 @@ void wrenFreeVM(WrenVM* vm)
+@@ -119,6 +132,14 @@ void wrenFreeVM(WrenVM* vm)
  
    wrenSymbolTableClear(vm, &vm->methodNames);
  
@@ -133,7 +254,7 @@ index f63ab8c..c0f4c4a 100644
    DEALLOCATE(vm, vm);
  }
  
-@@ -168,6 +188,12 @@ void wrenCollectGarbage(WrenVM* vm)
+@@ -168,6 +189,12 @@ void wrenCollectGarbage(WrenVM* vm)
    // Method names.
    wrenBlackenSymbolTable(vm, &vm->methodNames);
  
@@ -146,7 +267,25 @@ index f63ab8c..c0f4c4a 100644
    // Now that we have grayed the roots, do a depth-first search over all of the
    // reachable objects.
    wrenBlackenObjects(vm);
-@@ -887,6 +913,28 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -351,7 +378,7 @@ static void bindMethod(WrenVM* vm, int methodType, int symbol,
+   const char* className = classObj->name->value;
+   if (methodType == CODE_METHOD_STATIC) classObj = classObj->obj.classObj;
+ 
+-  Method method;
++  Method method = {0};
+   if (IS_STRING(methodValue))
+   {
+     const char* name = AS_CSTRING(methodValue);
+@@ -585,7 +612,7 @@ static void bindForeignClass(WrenVM* vm, ObjClass* classObj, ObjModule* module)
+ #endif
+   }
+   
+-  Method method;
++  Method method = {0};
+   method.type = METHOD_FOREIGN;
+ 
+   // Add the symbol even if there is no allocator so we can ensure that the
+@@ -887,6 +914,28 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
      #define DEBUG_TRACE_INSTRUCTIONS() do { } while (false)
    #endif
  
@@ -175,7 +314,7 @@ index f63ab8c..c0f4c4a 100644
    #if WREN_COMPUTED_GOTO
  
    static void* dispatchTable[] = {
-@@ -902,6 +950,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -902,6 +951,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
        do                                                                       \
        {                                                                        \
          DEBUG_TRACE_INSTRUCTIONS();                                            \
@@ -183,7 +322,7 @@ index f63ab8c..c0f4c4a 100644
          goto *dispatchTable[instruction = (Code)READ_BYTE()];                  \
        } while (false)
  
-@@ -910,6 +959,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -910,6 +960,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
    #define INTERPRET_LOOP                                                       \
        loop:                                                                    \
          DEBUG_TRACE_INSTRUCTIONS();                                            \
@@ -191,7 +330,153 @@ index f63ab8c..c0f4c4a 100644
          switch (instruction = (Code)READ_BYTE())
  
    #define CASE_CODE(name)  case CODE_##name
-@@ -1079,6 +1129,108 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -1045,6 +1096,137 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+       switch (method->type)
+       {
+         case METHOD_PRIMITIVE:
++        {
++          bool fastHandled = false;
++          if (numArgs == 1)
++          {
++            switch ((PrimitiveFastKind)method->fastKind)
++            {
++              case PRIMITIVE_FAST_NUM_FLOOR:
++                args[0] = NUM_VAL(floor(AS_NUM(args[0])));
++                fastHandled = true;
++                break;
++              case PRIMITIVE_FAST_NUM_SQRT:
++                args[0] = NUM_VAL(sqrt(AS_NUM(args[0])));
++                fastHandled = true;
++                break;
++              case PRIMITIVE_FAST_LIST_COUNT:
++                args[0] = NUM_VAL(AS_LIST(args[0])->elements.count);
++                fastHandled = true;
++                break;
++              default: break;
++            }
++          }
++          if (numArgs == 2)
++          {
++            switch ((PrimitiveFastKind)method->fastKind)
++            {
++              case PRIMITIVE_FAST_NUM_PLUS:
++              case PRIMITIVE_FAST_NUM_MINUS:
++              case PRIMITIVE_FAST_NUM_MULTIPLY:
++              case PRIMITIVE_FAST_NUM_DIVIDE:
++              case PRIMITIVE_FAST_NUM_LT:
++              case PRIMITIVE_FAST_NUM_GT:
++              case PRIMITIVE_FAST_NUM_LTE:
++              case PRIMITIVE_FAST_NUM_GTE:
++              case PRIMITIVE_FAST_NUM_MOD:
++                if (IS_NUM(args[1]))
++                {
++                  double left = AS_NUM(args[0]);
++                  double right = AS_NUM(args[1]);
++                  switch ((PrimitiveFastKind)method->fastKind)
++                  {
++                    case PRIMITIVE_FAST_NUM_PLUS: args[0] = NUM_VAL(left + right); break;
++                    case PRIMITIVE_FAST_NUM_MINUS: args[0] = NUM_VAL(left - right); break;
++                    case PRIMITIVE_FAST_NUM_MULTIPLY: args[0] = NUM_VAL(left * right); break;
++                    case PRIMITIVE_FAST_NUM_DIVIDE: args[0] = NUM_VAL(left / right); break;
++                    case PRIMITIVE_FAST_NUM_LT: args[0] = BOOL_VAL(left < right); break;
++                    case PRIMITIVE_FAST_NUM_GT: args[0] = BOOL_VAL(left > right); break;
++                    case PRIMITIVE_FAST_NUM_LTE: args[0] = BOOL_VAL(left <= right); break;
++                    case PRIMITIVE_FAST_NUM_GTE: args[0] = BOOL_VAL(left >= right); break;
++                    case PRIMITIVE_FAST_NUM_MOD: args[0] = NUM_VAL(fmod(left, right)); break;
++                    default: break;
++                  }
++                  fastHandled = true;
++                }
++                break;
++              case PRIMITIVE_FAST_NUM_EQ:
++                args[0] = BOOL_VAL(IS_NUM(args[1]) &&
++                                   AS_NUM(args[0]) == AS_NUM(args[1]));
++                fastHandled = true;
++                break;
++              case PRIMITIVE_FAST_NUM_NEQ:
++                args[0] = BOOL_VAL(!IS_NUM(args[1]) ||
++                                   AS_NUM(args[0]) != AS_NUM(args[1]));
++                fastHandled = true;
++                break;
++              case PRIMITIVE_FAST_LIST_SUBSCRIPT:
++                if (IS_NUM(args[1]))
++                {
++                  ObjList* list = AS_LIST(args[0]);
++                  double rawIndex = AS_NUM(args[1]);
++                  if (rawIndex >= 0.0 && rawIndex <= (double)UINT32_MAX)
++                  {
++                    uint32_t index = (uint32_t)rawIndex;
++                    if (rawIndex == (double)index &&
++                        index < (uint32_t)list->elements.count)
++                    {
++                      args[0] = list->elements.data[index];
++                      fastHandled = true;
++                    }
++                  }
++                }
++                break;
++              case PRIMITIVE_FAST_MAP_SUBSCRIPT:
++                if (wrenMapIsValidKey(args[1]))
++                {
++                  Value value = wrenMapGet(AS_MAP(args[0]), args[1]);
++                  args[0] = IS_UNDEFINED(value) ? NULL_VAL : value;
++                  fastHandled = true;
++                }
++                break;
++              default: break;
++            }
++          }
++          if (numArgs == 3)
++          {
++            switch ((PrimitiveFastKind)method->fastKind)
++            {
++              case PRIMITIVE_FAST_LIST_SUBSCRIPT_SETTER:
++                if (IS_NUM(args[1]))
++                {
++                  ObjList* list = AS_LIST(args[0]);
++                  double rawIndex = AS_NUM(args[1]);
++                  if (rawIndex >= 0.0 && rawIndex <= (double)UINT32_MAX)
++                  {
++                    uint32_t index = (uint32_t)rawIndex;
++                    if (rawIndex == (double)index &&
++                        index < (uint32_t)list->elements.count)
++                    {
++                      list->elements.data[index] = args[2];
++                      args[0] = args[2];
++                      fastHandled = true;
++                    }
++                  }
++                }
++                break;
++              case PRIMITIVE_FAST_MAP_SUBSCRIPT_SETTER:
++                if (wrenMapIsValidKey(args[1]))
++                {
++                  Value value = args[2];
++                  wrenMapSet(vm, AS_MAP(args[0]), args[1], value);
++                  args[0] = value;
++                  fastHandled = true;
++                }
++                break;
++              default: break;
++            }
++          }
++          if (fastHandled)
++          {
++            fiber->stackTop -= numArgs - 1;
++            break;
++          }
+           if (method->as.primitive(vm, args))
+           {
+             // The result is now in the first arg slot. Discard the other
+@@ -1061,6 +1243,7 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+             LOAD_FRAME();
+           }
+           break;
++        }
+ 
+         case METHOD_FUNCTION_CALL: 
+           if (!checkArity(vm, args[0], numArgs)) {
+@@ -1079,6 +1262,108 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
            break;
  
          case METHOD_BLOCK:
@@ -300,7 +585,7 @@ index f63ab8c..c0f4c4a 100644
            STORE_FRAME();
            wrenCallFunction(vm, fiber, (ObjClosure*)method->as.closure, numArgs);
            LOAD_FRAME();
-@@ -1158,6 +1310,62 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
+@@ -1158,6 +1443,57 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
        // Jump back to the top of the loop.
        uint16_t offset = READ_SHORT();
        ip -= offset;
@@ -313,14 +598,9 @@ index f63ab8c..c0f4c4a 100644
 +        if (jitTrace != NULL)
 +        {
 +          STORE_FRAME();
-+          int jitResult = wrenJitExecute(vm, jitTrace);
-+          // Restore interpreter state from the side-exit snapshot.
-+          // exitIdx is 0-based (jitResult - 1).
-+          if (jitResult != 0)
-+          {
-+            wrenJitRestoreExit(vm, vm->jit, fiber, frame,
-+                               jitTrace, jitResult - 1);
-+          }
++          wrenJitExecute(vm, jitTrace);
++          // wrenJitExecute restores side-exit metadata after the generated
++          // stub materializes live values.
 +          LOAD_FRAME();
 +          DISPATCH();
 +        }

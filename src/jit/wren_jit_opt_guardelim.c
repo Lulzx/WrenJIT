@@ -128,9 +128,20 @@ static void phaseA(IRBuffer* buf)
         if (n->flags & IR_FLAG_DEAD) continue;
         switch (n->op) {
             case IR_ADD: case IR_SUB: case IR_MUL: case IR_DIV: case IR_MOD:
-            case IR_NEG: case IR_CONST_NUM: case IR_UNBOX_NUM: case IR_UNBOX_INT:
+            case IR_NEG: case IR_SQRT: case IR_FLOOR:
+            case IR_CONST_NUM: case IR_UNBOX_NUM: case IR_UNBOX_INT:
                 bsSet(guardedNum, i);
                 break;
+            case IR_PHI: {
+                // A loop-carried PHI whose entry and back-edge values are both
+                // provably numeric (constants, unboxed doubles, or BOX_NUM)
+                // can never hold a non-number, so GUARD_NUM on it never fires.
+                uint16_t e = n->op1, b = n->op2;
+                if (writtenValueIsNumeric(buf, e) &&
+                    writtenValueIsNumeric(buf, b))
+                    bsSet(guardedNum, i);
+                break;
+            }
             default:
                 if (n->type == IR_TYPE_NUM || n->type == IR_TYPE_INT)
                     bsSet(guardedNum, i);
@@ -233,6 +244,23 @@ static void phaseB(IRBuffer* buf)
                 }
             }
             if (loadedInLoop) continue; // must keep this STORE_STACK
+
+            // Condition 2b: the slot may also be read from the interpreter
+            // stack after the loop's back edge (the outer-closure RESUME
+            // re-sync emits LOAD_STACK for every slot < after_depth after the
+            // loop). With the store gone, that read sees a stale value.
+            if (loopBack + 1 < buf->count) {
+                bool loadedAfter = false;
+                for (uint16_t k = (uint16_t)(loopBack + 1); k < buf->count; k++) {
+                    const IRNode* m = &buf->nodes[k];
+                    if (m->flags & IR_FLAG_DEAD) continue;
+                    if (m->op == IR_LOAD_STACK && m->imm.mem.slot == slot) {
+                        loadedAfter = true;
+                        break;
+                    }
+                }
+                if (loadedAfter) continue; // must keep this STORE_STACK
+            }
         }
 
         // Condition 1: no CALL between here and the next snapshot/exit.

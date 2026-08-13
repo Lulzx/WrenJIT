@@ -10,6 +10,7 @@
 void irBufferInit(IRBuffer* buf)
 {
     memset(buf, 0, sizeof(IRBuffer));
+    buf->loop_header = (uint16_t)IR_NONE;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,13 +193,36 @@ void irSnapshotAddEntry(IRBuffer* buf, uint16_t snapshot_id, uint16_t slot,
 uint16_t irEmitLoopHeader(IRBuffer* buf)
 {
     uint16_t id = irEmit(buf, IR_LOOP_HEADER, IR_NONE, IR_NONE, IR_TYPE_VOID);
-    buf->loop_header = id;
+    // Nested-loop recording emits a second LOOP_HEADER for the inner loop.
+    // Keep the FIRST one as the trace's single-loop boundary: the optimizer
+    // passes that use buf->loop_header reason about the whole trace as one
+    // loop, so it must be the outermost header, not the innermost.
+    if (buf->loop_header == (uint16_t)IR_NONE || buf->loop_header >= id)
+        buf->loop_header = id;
     return id;
+}
+
+uint16_t irEmitLoopHeaderRaw(IRBuffer* buf)
+{
+    return irEmit(buf, IR_LOOP_HEADER, IR_NONE, IR_NONE, IR_TYPE_VOID);
 }
 
 uint16_t irEmitLoopBack(IRBuffer* buf)
 {
     return irEmit(buf, IR_LOOP_BACK, buf->loop_header, IR_NONE, IR_TYPE_VOID);
+}
+
+uint16_t irEmitLoopBackTo(IRBuffer* buf, uint16_t header)
+{
+    return irEmit(buf, IR_LOOP_BACK, header, IR_NONE, IR_TYPE_VOID);
+}
+
+uint16_t irEmitLoopExit(IRBuffer* buf, uint16_t cond)
+{
+    uint16_t id = irEmit(buf, IR_LOOP_EXIT, cond, IR_NONE, IR_TYPE_VOID);
+    buf->nodes[id].imm.jump.target = IR_NONE;
+    buf->nodes[id].imm.jump.snapshot = IR_NONE;
+    return id;
 }
 
 uint16_t irEmitSideExit(IRBuffer* buf, uint16_t snapshot_id)
@@ -244,6 +268,8 @@ const char* irOpName(IROp op)
     case IR_DIV:            return "DIV";
     case IR_MOD:            return "MOD";
     case IR_NEG:            return "NEG";
+    case IR_SQRT:           return "SQRT";
+    case IR_FLOOR:          return "FLOOR";
     case IR_LT:             return "LT";
     case IR_GT:             return "GT";
     case IR_LTE:            return "LTE";
@@ -256,11 +282,17 @@ const char* irOpName(IROp op)
     case IR_BNOT:           return "BNOT";
     case IR_LSHIFT:         return "LSHIFT";
     case IR_RSHIFT:         return "RSHIFT";
+    case IR_ASHR:           return "ASHR";
     case IR_LOAD_STACK:     return "LOAD_STACK";
     case IR_STORE_STACK:    return "STORE_STACK";
     case IR_LOAD_FIELD:     return "LOAD_FIELD";
     case IR_STORE_FIELD:    return "STORE_FIELD";
     case IR_LOAD_RANGE:     return "LOAD_RANGE";
+    case IR_LIST_COUNT:     return "LIST_COUNT";
+    case IR_LIST_LOAD:      return "LIST_LOAD";
+    case IR_LIST_STORE:     return "LIST_STORE";
+    case IR_LIST_BOUNDS_GUARD: return "LIST_BOUNDS_GUARD";
+    case IR_LIST_DATA:      return "LIST_DATA";
     case IR_LOAD_MODULE_VAR:  return "LOAD_MODULE_VAR";
     case IR_STORE_MODULE_VAR: return "STORE_MODULE_VAR";
     case IR_BOX_NUM:        return "BOX_NUM";
@@ -278,9 +310,11 @@ const char* irOpName(IROp op)
     case IR_GUARD_TRUE:     return "GUARD_TRUE";
     case IR_GUARD_FALSE:    return "GUARD_FALSE";
     case IR_GUARD_NOT_NULL: return "GUARD_NOT_NULL";
+    case IR_GUARD_RANGE:    return "GUARD_RANGE";
     case IR_PHI:            return "PHI";
     case IR_LOOP_HEADER:    return "LOOP_HEADER";
     case IR_LOOP_BACK:      return "LOOP_BACK";
+    case IR_LOOP_EXIT:      return "LOOP_EXIT";
     case IR_SIDE_EXIT:      return "SIDE_EXIT";
     case IR_TOGGLE_COUNT_BULK: return "TOGGLE_COUNT_BULK";
     case IR_RANGE_SUM_BULK: return "RANGE_SUM_BULK";
@@ -312,6 +346,9 @@ void irBufferDump(const IRBuffer* buf)
         case IR_CONST_OBJ:
             printf(" %p", n->imm.ptr);
             break;
+        case IR_CONST_INT:
+            printf(" %d", n->imm.intval);
+            break;
         case IR_LOAD_STACK:
         case IR_STORE_STACK:
             printf(" slot=%d", n->imm.mem.slot);
@@ -324,6 +361,9 @@ void irBufferDump(const IRBuffer* buf)
             break;
         case IR_SIDE_EXIT:
             printf(" snap=%d", n->imm.snapshot_id);
+            break;
+        case IR_LOOP_EXIT:
+            printf(" %%%04d -> %%%04d", n->op1, n->imm.jump.target);
             break;
         case IR_GUARD_NUM:
         case IR_GUARD_BOOL:
@@ -338,6 +378,11 @@ void irBufferDump(const IRBuffer* buf)
         case IR_SNAPSHOT:
             printf(" #%d", n->imm.snapshot_id);
             break;
+        case IR_LIST_STORE:
+            if (n->op1 != IR_NONE) printf(" %%%04d", n->op1);
+            if (n->op2 != IR_NONE) printf(" %%%04d", n->op2);
+            printf(" val=%%%04d", n->imm.list.value);
+            break;
         default:
             if (n->op1 != IR_NONE) printf(" %%%04d", n->op1);
             if (n->op2 != IR_NONE) printf(" %%%04d", n->op2);
@@ -351,6 +396,7 @@ void irBufferDump(const IRBuffer* buf)
             if (n->flags & IR_FLAG_INVARIANT) printf("inv ");
             if (n->flags & IR_FLAG_HOISTED) printf("hoist ");
             if (n->flags & IR_FLAG_GUARD) printf("guard ");
+            if (n->flags & IR_FLAG_SNAPSHOT_ONLY_BOX) printf("snapshot-box ");
             printf("]");
         }
         printf("\n");
@@ -366,5 +412,35 @@ void irBufferDump(const IRBuffer* buf)
             printf(" %d:%%%04d", e->slot, e->ssa_ref);
         }
         printf(" ]\n");
+    }
+}
+
+void irMarkSnapshotOnlyBoxes(IRBuffer* buf)
+{
+    for (uint16_t i = 0; i < buf->count; i++) {
+        IRNode* n = &buf->nodes[i];
+        n->flags &= ~IR_FLAG_SNAPSHOT_ONLY_BOX;
+        if (!(n->flags & IR_FLAG_DEAD) &&
+            (n->op == IR_BOX_NUM || n->op == IR_BOX_INT))
+            n->flags |= IR_FLAG_SNAPSHOT_ONLY_BOX;
+    }
+
+    for (uint16_t i = 0; i < buf->count; i++) {
+        const IRNode* n = &buf->nodes[i];
+        if (n->flags & IR_FLAG_DEAD) continue;
+        if (n->op1 != IR_NONE && n->op1 < buf->count)
+            buf->nodes[n->op1].flags &= ~IR_FLAG_SNAPSHOT_ONLY_BOX;
+        if (n->op != IR_GUARD_CLASS && n->op2 != IR_NONE &&
+            n->op2 < buf->count)
+            buf->nodes[n->op2].flags &= ~IR_FLAG_SNAPSHOT_ONLY_BOX;
+        if (n->op == IR_LIST_STORE && n->imm.list.value < buf->count)
+            buf->nodes[n->imm.list.value].flags &=
+                (uint8_t)~IR_FLAG_SNAPSHOT_ONLY_BOX;
+    }
+
+    for (uint16_t i = 0; i < buf->exit_module_entry_count; i++) {
+        uint16_t ref = buf->exit_module_entries[i].ssa_ref;
+        if (ref < buf->count)
+            buf->nodes[ref].flags &= (uint8_t)~IR_FLAG_SNAPSHOT_ONLY_BOX;
     }
 }

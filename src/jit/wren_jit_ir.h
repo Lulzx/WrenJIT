@@ -27,6 +27,8 @@ typedef enum {
     IR_DIV,
     IR_MOD,
     IR_NEG,
+    IR_SQRT,
+    IR_FLOOR,
 
     // Comparison (raw doubles -> bool)
     IR_LT,
@@ -43,6 +45,7 @@ typedef enum {
     IR_BNOT,
     IR_LSHIFT,
     IR_RSHIFT,
+    IR_ASHR,              // arithmetic shift right == floor(x / 2^k)
 
     // Stack access
     IR_LOAD_STACK,       // load from interpreter stack slot
@@ -52,6 +55,11 @@ typedef enum {
     IR_LOAD_FIELD,       // load object field
     IR_STORE_FIELD,      // store object field
     IR_LOAD_RANGE,       // load an ObjRange shape field as a raw double
+    IR_LIST_COUNT,       // load List.count as a raw double
+    IR_LIST_LOAD,        // guarded list[index] load (op1=list, op2=raw index)
+    IR_LIST_STORE,       // guarded list[index] store (value in imm.list.value)
+    IR_LIST_BOUNDS_GUARD,// hoisted list.count >= limit guard (op1=list, op2=limit)
+    IR_LIST_DATA,        // cached List.elements.data pointer (op1=list) -> ptr
 
     // Module variable access
     IR_LOAD_MODULE_VAR,
@@ -75,11 +83,18 @@ typedef enum {
     IR_GUARD_TRUE,       // assert value is truthy (not false/null)
     IR_GUARD_FALSE,      // assert value is falsy
     IR_GUARD_NOT_NULL,   // assert value is not null
+    IR_GUARD_RANGE,      // assert exact-integer value with |value| <= limit
 
     // Control flow
     IR_PHI,              // SSA phi node (at loop header)
     IR_LOOP_HEADER,      // marks the start of the loop
     IR_LOOP_BACK,        // backward jump to loop header
+    IR_LOOP_EXIT,        // nested-loop condition: if op1 is falsy, jump
+                         // forward to imm.jump.target (the code after the
+                         // enclosing nested loop); else fall through to body.
+                         // When imm.jump.snapshot != IR_NONE the truthy path
+                         // side-exits to that snapshot instead of falling
+                         // through (a loop recorded at its final iteration).
     IR_SIDE_EXIT,        // exit trace to interpreter
     IR_TOGGLE_COUNT_BULK,// fast-forward guarded boolean-toggle/count recurrence
     IR_RANGE_SUM_BULK,   // fast-forward exact nonnegative integer range sum
@@ -144,6 +159,10 @@ typedef struct {
             uint16_t field;      // field index (for field ops)
         } mem;
         struct {
+            uint16_t value;      // stored boxed Value (IR_LIST_STORE only)
+            uint16_t snapshot;   // type/index/bounds failure exit
+        } list;
+        struct {
             uint16_t limit;      // raw numeric range limit SSA
             uint16_t state;      // boxed boolean state SSA
             uint16_t object;     // boxed instance SSA
@@ -156,10 +175,18 @@ typedef struct {
             uint16_t snapshot;
             uint16_t fallback;
         } arith;
+        struct {
+            uint16_t snapshot;   // deopt snapshot (resumes before the loop body)
+            uint16_t direction;   // 0 = index < limit, 1 = index <= limit
+        } bounds;
+        struct {
+            uint16_t target;     // forward target node id (IR_LOOP_EXIT)
+            uint16_t snapshot;   // deopt snapshot for the truthy path, or IR_NONE
+        } jump;
     } imm;
 
     // Optimization metadata.
-    uint8_t flags;
+    uint16_t flags;
     #define IR_FLAG_DEAD      0x01   // marked dead by DCE
     #define IR_FLAG_INVARIANT 0x02   // loop-invariant (can hoist)
     #define IR_FLAG_HOISTED   0x04   // already hoisted
@@ -170,13 +197,21 @@ typedef struct {
     // Comparison is consumed only by BOX_BOOL -> GUARD_TRUE. Code generation
     // emits the inverse comparison directly to the guard's side exit.
     #define IR_FLAG_FUSED_TRUE_GUARD 0x20
+    // Comparison is consumed only by IR_LOOP_EXIT (raw, no BOX_BOOL). Code
+    // generation skips the comparison entirely (its bool result is dead) and
+    // IR_LOOP_EXIT branches directly on the comparison operands.
+    #define IR_FLAG_FUSED_LOOP_EXIT 0x100
+    #define IR_FLAG_SNAPSHOT_ONLY_BOX 0x40
+    // List access whose per-access bounds check is hoisted to a
+    // IR_LIST_BOUNDS_GUARD at the loop header.
+    #define IR_FLAG_BOUNDS_HOISTED 0x80
 } IRNode;
 
 // ---------------------------------------------------------------------------
 // IR buffer limits
 // ---------------------------------------------------------------------------
 #define IR_MAX_NODES 4096
-#define IR_MAX_SNAPSHOTS 256
+#define IR_MAX_SNAPSHOTS 1024
 #define IR_MAX_SNAPSHOT_ENTRIES 64
 #define IR_MAX_EXIT_MODULE_ENTRIES 1024
 
@@ -192,7 +227,8 @@ typedef struct {
 
 // A module write deferred from the hot loop to a side exit. The referenced
 // SSA value is deliberately unboxed; the exit stub materializes the Wren
-// Value directly in module memory.
+// Value directly in module memory, gated by the runtime back-edge flag so an
+// entry-time exit leaves the pre-loop value untouched.
 typedef struct {
     void* address;
     uint16_t ssa_ref;
@@ -263,7 +299,10 @@ void irSnapshotAddEntry(IRBuffer* buf, uint16_t snapshot_id, uint16_t slot,
                         uint16_t ssa_ref);
 
 uint16_t irEmitLoopHeader(IRBuffer* buf);
+uint16_t irEmitLoopHeaderRaw(IRBuffer* buf);
 uint16_t irEmitLoopBack(IRBuffer* buf);
+uint16_t irEmitLoopBackTo(IRBuffer* buf, uint16_t header);
+uint16_t irEmitLoopExit(IRBuffer* buf, uint16_t cond);
 uint16_t irEmitSideExit(IRBuffer* buf, uint16_t snapshot_id);
 uint16_t irEmitPhi(IRBuffer* buf, uint16_t op1, uint16_t op2, IRType type);
 
@@ -272,5 +311,6 @@ uint16_t irEmitPhi(IRBuffer* buf, uint16_t op1, uint16_t op2, IRType type);
 // ---------------------------------------------------------------------------
 const char* irOpName(IROp op);
 void irBufferDump(const IRBuffer* buf);
+void irMarkSnapshotOnlyBoxes(IRBuffer* buf);
 
 #endif // wren_jit_ir_h

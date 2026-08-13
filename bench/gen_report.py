@@ -37,6 +37,16 @@ DESCRIPTIONS = {
     "bench_method_call": "Three million activate/getter calls on a user-defined class.",
     "bench_sum": "Sums 0..999999 in a <code>while</code> loop.",
     "bench_for": "Sums 1..1000000 with <code>for i in 1..n</code>.",
+    "benchmarksgame_fannkuch_redux": "Permutation flips from the Benchmarks Game, scaled to <code>n=10</code>.",
+    "benchmarksgame_nbody": "Five-body solar-system simulation, scaled to 500,000 time steps.",
+    "benchmarksgame_spectral_norm": "Spectral norm of a 500-element implicit matrix.",
+    "benchmarksgame_mandelbrot": "Mandelbrot kernel at 600&times;600; output is reduced to a pixel checksum.",
+    "benchmarksgame_fasta": "FASTA linear-congruential generator over 500,000 symbols; output is checksummed.",
+    "benchmarksgame_k_nucleotide": "K-mer counts over 250,000 deterministic bases.",
+    "benchmarksgame_reverse_complement": "In-place reverse complement of one million encoded bases.",
+    "benchmarksgame_binary_trees": "Binary-tree allocation and traversal through depth 14.",
+    "benchmarksgame_pidigits": "Array spigot producing 2,000 digits without a bignum extension.",
+    "benchmarksgame_regex_redux": "The nine regex-redux variant patterns using the same mask matcher in both languages.",
 }
 
 
@@ -45,6 +55,8 @@ def tool_version(command: list[str], fallback: str) -> str:
         out = subprocess.run(
             command, capture_output=True, text=True, timeout=10
         )
+        if out.returncode != 0:
+            return fallback
         text = (out.stdout + out.stderr).strip().splitlines()
         return text[0] if text else fallback
     except (OSError, subprocess.SubprocessError):
@@ -85,8 +97,9 @@ def render_chart(entry: dict) -> str:
         rows.append(
             '  <tr>\n'
             f'    <th>{html.escape(label)}</th>'
-            f'<td><div class="chart-bar {css}" style="width: {width:.1f}%;">'
-            f'{milliseconds(seconds)}ms&nbsp;</div></td>\n'
+            f'<td class="bar-cell"><div class="chart-bar {css}" '
+            f'style="width: {width:.1f}%;"></div></td>'
+            f'<td class="chart-value">{milliseconds(seconds)}ms</td>\n'
             '  </tr>'
         )
     return '<table class="chart">\n' + "\n".join(rows) + "\n</table>"
@@ -184,16 +197,15 @@ a:hover { text-decoration: underline; }
 table.chart { margin: 4px 0 0 0; padding: 5px 0 5px 25px; border-collapse: collapse; width: 100%; }
 table.chart td, table.chart th { line-height: 14px; margin: 0; padding: 1px 0; }
 table.chart th { font-size: 14px; width: 118px; text-align: left; font-weight: normal; color: var(--gray-80); }
+table.chart td.bar-cell { width: auto; padding-right: 8px; }
+table.chart td.chart-value { width: 72px; text-align: right; font-size: 13px; white-space: nowrap; }
 table.chart .chart-bar {
-  display: inline-block;
-  font: 13px var(--body);
-  color: var(--light);
+  display: block;
+  height: 14px;
   background: var(--link);
   border-bottom: solid 1px var(--link-dark);
-  text-align: right;
   border-radius: 2px;
-  white-space: nowrap;
-  min-width: 54px;
+  min-width: 1px;
 }
 table.chart .chart-bar.wren { background: var(--wren); }
 table.chart .chart-bar.wren-jit { background: var(--link); }
@@ -230,6 +242,19 @@ def render(entries: list[dict], cpu: str, when: str) -> str:
             parts.append(note)
         sections.append("\n".join(parts))
 
+    comparisons = []
+    for entry in entries:
+        values = collect(entry)
+        if "wren_jit" in values and "luajit_on" in values:
+            comparisons.append(values["wren_jit"] < values["luajit_on"])
+    wins = sum(comparisons)
+    standing = (
+        f"WrenJIT is faster than LuaJIT on {wins} of {len(comparisons)} paired "
+        "kernels in this run."
+        if comparisons
+        else "No paired WrenJIT/LuaJIT results were supplied."
+    )
+
     wren_version = tool_version(["git", "-C", str(ROOT / "vendor" / "wren"),
                                  "rev-parse", "--short", "HEAD"], "unknown")
     luajit_version = tool_version(["luajit", "-v"], "LuaJIT (not found)")
@@ -247,12 +272,12 @@ def render(entries: list[dict], cpu: str, when: str) -> str:
 <div class="page">
 
 <h1>WrenJIT Performance</h1>
-<p class="subtitle">Small compiler. Hard guards. No benchmark losses.</p>
+<p class="subtitle">Small compiler. Hard guards. Measured honestly.</p>
 
 <p>Every benchmark below exists twice: once in Wren, once in Lua, written to do
 the same work in the same shape. Both print their own elapsed time. Process
 startup is excluded; WrenJIT warmup and compilation are included. Each bar is
-the best of five runs. Shorter is better.</p>
+the best timing recorded in the input results. Shorter is better.</p>
 
 <p class="legend">
 <span class="swatch" style="background: var(--link)"></span>wren (jit)
@@ -263,8 +288,7 @@ the best of five runs. Shorter is better.</p>
 
 <h2>Where things stand</h2>
 
-<p>WrenJIT is faster than LuaJIT on every paired kernel in this suite. Loops use
-typed SSA traces. Exact recursive bytecode shapes use guarded native kernels.
+<p>{standing} Loops use typed SSA traces. Exact recursive bytecode shapes use guarded native kernels.
 Range sums and alternating boolean counters are reduced as recurrences instead
 of paid one iteration at a time. A failed proof exits to the Wren interpreter.</p>
 

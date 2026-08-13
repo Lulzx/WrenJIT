@@ -144,6 +144,7 @@ TEST(test_nested_while) {
     WrenInterpretResult result = wrenInterpret(vm, "main", src);
     assert(result == WREN_RESULT_SUCCESS);
     assert(strstr(output_buf, "100") != NULL);
+    assert(vm->jit->traces_compiled >= 1);
     wrenFreeVM(vm);
 }
 
@@ -187,9 +188,7 @@ TEST(test_multiple_vms) {
 }
 
 
-TEST(test_modulo_falls_back_safely) {
-    // IR_MOD has no native code generator yet. The recorder must reject it
-    // instead of compiling a trace whose result register is undefined.
+TEST(test_integer_modulo) {
     resetOutput();
     WrenVM* vm = createVM();
     const char* src =
@@ -203,6 +202,253 @@ TEST(test_modulo_falls_back_safely) {
     WrenInterpretResult result = wrenInterpret(vm, "main", src);
     assert(result == WREN_RESULT_SUCCESS);
     assert(strstr(output_buf, "2997") != NULL);
+    assert(vm->jit->traces_compiled == 1);
+    wrenFreeVM(vm);
+}
+
+TEST(test_fractional_modulo_side_exits) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var sum = 0\n"
+        "var i = 0\n"
+        "while (i < 100) {\n"
+        "  sum = sum + ((i + 0.5) % 7)\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(sum)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "345") != NULL);
+    assert(vm->jit->traces_compiled == 1);
+    assert(vm->jit->total_exits > 0);
+    wrenFreeVM(vm);
+}
+
+TEST(test_native_sqrt_and_floor) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var roots = 0\n"
+        "var i = 1\n"
+        "while (i <= 1000) {\n"
+        "  roots = roots + (i * i).sqrt\n"
+        "  i = i + 1\n"
+        "}\n"
+        "var floors = 0\n"
+        "i = 0\n"
+        "while (i < 1000) {\n"
+        "  floors = floors + (i + 0.75).floor\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(\"%(roots),%(floors)\")\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "500500,499500") != NULL);
+    assert(vm->jit->traces_compiled == 2);
+    wrenFreeVM(vm);
+}
+
+TEST(test_native_bitwise_ops) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var sum = 0\n"
+        "var i = 0\n"
+        "while (i < 1000) {\n"
+        "  sum = sum + ((1 << (i % 4)) & 15)\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(sum)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "3750") != NULL);
+    assert(vm->jit->traces_compiled == 1);
+    wrenFreeVM(vm);
+}
+
+TEST(test_list_index_load_store) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var values = []\n"
+        "for (i in 0...256) values.add(i)\n"
+        "var sum = 0\n"
+        "var i = 0\n"
+        "while (i < 1000) {\n"
+        "  var index = i % 256\n"
+        "  values[index] = values[index] + 1\n"
+        "  sum = sum + values[index]\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(\"%(sum),%(values[0]),%(values[255])\")\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "127180,4,258") != NULL);
+    assert(vm->jit->traces_compiled >= 1);
+    wrenFreeVM(vm);
+}
+
+TEST(test_list_length_bound_stays_numeric) {
+    // A promoted integer loop counter compared with an invariant numeric list
+    // length must not make codegen read the counter from an FP allocation.
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var values = []\n"
+        "for (i in 0...10000) values.add(i % 7)\n"
+        "var sum = 0\n"
+        "var i = 0\n"
+        "while (i < values.count) {\n"
+        "  sum = sum + values[i]\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(sum)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "29994") != NULL);
+    assert(vm->jit->traces_compiled >= 1);
+    wrenFreeVM(vm);
+}
+
+TEST(test_list_bounds_hoisted_out_of_counted_loop) {
+    // A while loop with an invariant list, an ascending integral index PHI,
+    // and an invariant numeric limit must hoist the list bounds check to a
+    // single IR_LIST_BOUNDS_GUARD at loop entry.
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var values = []\n"
+        "for (i in 0...1000) values.add(i % 7)\n"
+        "var sum = 0\n"
+        "var i = 0\n"
+        "while (i < 1000) {\n"
+        "  sum = sum + values[i]\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(sum)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "2997") != NULL);
+    assert(vm->jit->traces_compiled >= 1);
+    bool hoisted = false;
+    for (uint32_t i = 0; i < vm->jit->trace_capacity; i++) {
+        JitTrace* trace = &vm->jit->traces[i];
+        if (trace->anchor_pc != NULL && trace->bounds_hoisted_guards > 0) {
+            hoisted = true;
+            break;
+        }
+    }
+    assert(hoisted);
+    wrenFreeVM(vm);
+}
+
+TEST(test_list_bounds_hoisted_guard_fires_out_of_bounds) {
+    // A trace compiled against a long list must still throw when the same
+    // loop runs against a shorter list: the hoisted count guard side-exits
+    // and the interpreter reproduces the out-of-bounds error.
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var sum = 0\n"
+        "var run = Fn.new { |values, n|\n"
+        "  var i = 0\n"
+        "  while (i < n) {\n"
+        "    sum = sum + values[i]\n"
+        "    i = i + 1\n"
+        "  }\n"
+        "}\n"
+        "var long = []\n"
+        "for (i in 0...1000) long.add(i % 7)\n"
+        "run.call(long, 1000)\n"
+        "System.print(sum)\n"
+        "var short = [1, 2, 3]\n"
+        "run.call(short, 1000)\n"
+        "System.print(sum)\n";
+    WrenInterpretResult result = wrenInterpret(vm, "main", src);
+    assert(result == WREN_RESULT_RUNTIME_ERROR);
+    wrenFreeVM(vm);
+}
+
+TEST(test_nested_loop_exit_stays_in_trace) {
+    // The recorder opens the inner loop with an IR_LOOP_HEADER and patches its
+    // exit tests to jump in-trace past the loop (outer closure). If that patch
+    // regressed, the inner loop's termination would deopt to the interpreter on
+    // every outer iteration -- ~200k exits instead of a handful.
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var total = 0\n"
+        "var i = 0\n"
+        "while (i < 200000) {\n"
+        "  var j = 0\n"
+        "  while (j < 4) {\n"
+        "    total = total + 1\n"
+        "    j = j + 1\n"
+        "  }\n"
+        "  total = total + i\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(total)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "20000700000") != NULL);
+    assert(vm->jit->traces_compiled >= 1);
+    assert(vm->jit->total_exits < 1000);
+    wrenFreeVM(vm);
+}
+
+TEST(test_nested_loop_conditionally_skipped_stays_in_trace) {
+    // The inner loop is entered on 3 of every 4 outer iterations and is empty
+    // on the fourth. Its entry branch (recorded as a deopt-capable IR_LOOP_EXIT
+    // until a back edge proves it a loop) must be patched to jump in-trace past
+    // the loop so an empty inner loop skips its body without deopting.
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var total = 0\n"
+        "var i = 0\n"
+        "while (i < 200000) {\n"
+        "  var r = i % 4\n"
+        "  var j = 0\n"
+        "  while (j < r) {\n"
+        "    total = total + 1\n"
+        "    j = j + 1\n"
+        "  }\n"
+        "  total = total + i\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(total)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "20000200000") != NULL);
+    assert(vm->jit->traces_compiled >= 1);
+    assert(vm->jit->total_exits < 1000);
+    wrenFreeVM(vm);
+}
+
+TEST(test_degenerate_trace_re_recorded) {
+    // A trace recorded on a path that skipped a nested loop deopts on the
+    // common path (the fasta pattern). After enough such handoff exits the
+    // trace is retired, its loop's hot counter is re-armed, and the next pass
+    // re-records through the loop. The re-record must yield a healthy trace:
+    // bounded exits for 300k outer iterations, not an exit per iteration.
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var cumulative = [0.27, 0.39, 0.51, 0.78, 0.80, 0.82, 0.84,\n"
+        "    0.86, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 1]\n"
+        "var seed = 42\n"
+        "var total = 0\n"
+        "var i = 0\n"
+        "while (i < 300000) {\n"
+        "  seed = (seed * 3877 + 29573) % 139968\n"
+        "  var r = seed / 139968\n"
+        "  var j = 0\n"
+        "  while (r >= cumulative[j]) { j = j + 1 }\n"
+        "  total = total + j\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(total)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "945958") != NULL);
+    assert(vm->jit->re_records_done >= 1);
+    assert(vm->jit->total_exits < 100000);
+    // A later re-record can overwrite the disabled trace's table slot, so the
+    // retire itself (re_records_done) is the durable signal; the disabled flag
+    // on a specific slot is not guaranteed to survive.
     wrenFreeVM(vm);
 }
 
@@ -306,7 +552,7 @@ TEST(test_call0_toggler_returning_this_inline) {
         "class Toggle {\n"
         "  construct new(v) { _v = v }\n"
         "  value { _v }\n"
-        "  activate { _v = !_v return this }\n"
+        "  activate {\n    _v = !_v\n    return this\n  }\n"
         "}\n"
         "var t = Toggle.new(true)\n"
         "var count = 0\n"
@@ -329,7 +575,7 @@ TEST(test_toggle_counter_fast_forward_odd) {
         "class Toggle {\n"
         "  construct new(v) { _v = v }\n"
         "  value { _v }\n"
-        "  activate { _v = !_v return this }\n"
+        "  activate {\n    _v = !_v\n    return this\n  }\n"
         "}\n"
         "var t = Toggle.new(false)\n"
         "var count = 0\n"
@@ -445,6 +691,27 @@ TEST(test_huge_loop_value_stays_double) {
     wrenFreeVM(vm);
 }
 
+TEST(test_snapshot_only_number_materializes_on_exit) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var sum = 0\n"
+        "var i = 0\n"
+        "while (i < 200) {\n"
+        "  var x = i * 1.5 + 0.25\n"
+        "  if (i == 123) System.print(x)\n"
+        "  sum = sum + x\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(sum)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "184.75") != NULL);
+    assert(strstr(output_buf, "29900") != NULL);
+    assert(vm->jit->traces_compiled >= 1);
+    assert(vm->jit->total_exits >= 1);
+    wrenFreeVM(vm);
+}
+
 TEST(test_recursive_numeric_kernel) {
     resetOutput();
     WrenVM* vm = createVM();
@@ -467,7 +734,7 @@ TEST(test_recursive_tree_kernels) {
     WrenVM* vm = createVM();
     const char* src =
         "class Node {\n"
-        "  construct new(left, right) { _left = left _right = right }\n"
+        "  construct new(left, right) {\n    _left = left\n    _right = right\n  }\n"
         "  check {\n"
         "    if (_left == null) return 1\n"
         "    return 1 + _left.check + _right.check\n"
@@ -494,10 +761,14 @@ int main(void) {
     RUN(test_call0_toggler_returning_this_inline);
     RUN(test_toggle_counter_fast_forward_odd);
     RUN(test_fractional_loop_values_stay_double);
+    RUN(test_nested_loop_exit_stays_in_trace);
+    RUN(test_nested_loop_conditionally_skipped_stays_in_trace);
+    RUN(test_degenerate_trace_re_recorded);
     RUN(test_range_trace_reused_across_shapes);
     RUN(test_range_loop_stack_promotion);
     RUN(test_integer_comparison_specialization);
     RUN(test_huge_loop_value_stays_double);
+    RUN(test_snapshot_only_number_materializes_on_exit);
     RUN(test_recursive_numeric_kernel);
     RUN(test_recursive_tree_kernels);
     RUN(test_simple_sum);
@@ -507,7 +778,14 @@ int main(void) {
     RUN(test_multiplication_loop);
     RUN(test_nested_while);
     RUN(test_hot_loop);
-    RUN(test_modulo_falls_back_safely);
+    RUN(test_integer_modulo);
+    RUN(test_fractional_modulo_side_exits);
+    RUN(test_native_sqrt_and_floor);
+    RUN(test_native_bitwise_ops);
+    RUN(test_list_index_load_store);
+    RUN(test_list_length_bound_stays_numeric);
+    RUN(test_list_bounds_hoisted_out_of_counted_loop);
+    RUN(test_list_bounds_hoisted_guard_fires_out_of_bounds);
     RUN(test_nan_not_equal);
     RUN(test_multiple_vms);
     printf("All JIT tests passed!\n");

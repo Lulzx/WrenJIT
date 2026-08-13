@@ -17,6 +17,18 @@ LUA_BENCH_DIR = REPO_BENCH_DIR / "lua_equivalents"
 
 PAGE_BENCHMARKS = ["method_call", "delta_blue", "binary_trees", "fib"]
 REPO_BENCHMARKS = ["bench_sum", "bench_for", "bench_fib"]
+BENCHMARKSGAME_BENCHMARKS = [
+    "benchmarksgame_fannkuch_redux",
+    "benchmarksgame_nbody",
+    "benchmarksgame_spectral_norm",
+    "benchmarksgame_mandelbrot",
+    "benchmarksgame_fasta",
+    "benchmarksgame_k_nucleotide",
+    "benchmarksgame_reverse_complement",
+    "benchmarksgame_binary_trees",
+    "benchmarksgame_pidigits",
+    "benchmarksgame_regex_redux",
+]
 
 # Recursive workloads. None of these contain a traceable loop in the hot path,
 # so the JIT compiles zero traces for all of them today.
@@ -68,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--suite",
-        choices=["page", "repo", "recursion", "all"],
+        choices=["page", "repo", "recursion", "benchmarksgame", "all"],
         default="page",
         help="Named benchmark suite to run when --benchmarks is not set.",
     )
@@ -154,9 +166,16 @@ def resolve_benchmarks(args: argparse.Namespace) -> list[tuple[str, Path]]:
         suite_names = REPO_BENCHMARKS
     elif args.suite == "recursion":
         suite_names = RECURSION_BENCHMARKS
+    elif args.suite == "benchmarksgame":
+        suite_names = BENCHMARKSGAME_BENCHMARKS
     else:
         seen: dict[str, None] = {}
-        for name in PAGE_BENCHMARKS + REPO_BENCHMARKS + RECURSION_BENCHMARKS:
+        for name in (
+            PAGE_BENCHMARKS
+            + REPO_BENCHMARKS
+            + RECURSION_BENCHMARKS
+            + BENCHMARKSGAME_BENCHMARKS
+        ):
             seen.setdefault(name, None)
         suite_names = list(seen)
 

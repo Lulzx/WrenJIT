@@ -42,16 +42,15 @@ a:hover { text-decoration: underline; }
 table.chart { margin: 4px 0 0 0; padding: 5px 0 5px 25px; border-collapse: collapse; width: 100%; }
 table.chart td, table.chart th { line-height: 14px; margin: 0; padding: 1px 0; }
 table.chart th { font-size: 14px; width: 118px; text-align: left; font-weight: normal; color: var(--gray-80); }
+table.chart td.bar-cell { width: auto; padding-right: 8px; }
+table.chart td.chart-value { width: 72px; text-align: right; font-size: 13px; white-space: nowrap; }
 table.chart .chart-bar {
-  display: inline-block;
-  font: 13px var(--body);
-  color: var(--light);
+  display: block;
+  height: 14px;
   background: var(--link);
   border-bottom: solid 1px var(--link-dark);
-  text-align: right;
   border-radius: 2px;
-  white-space: nowrap;
-  min-width: 54px;
+  min-width: 1px;
 }
 table.chart .chart-bar.wren { background: var(--wren); }
 table.chart .chart-bar.wren-jit { background: var(--link); }
@@ -74,12 +73,12 @@ table.summary th { color: var(--gray-80); font-weight: 600; }
 <div class="page">
 
 <h1>WrenJIT Performance</h1>
-<p class="subtitle">Small compiler. Hard guards. No benchmark losses.</p>
+<p class="subtitle">Small compiler. Hard guards. Measured honestly.</p>
 
 <p>Every benchmark below exists twice: once in Wren, once in Lua, written to do
 the same work in the same shape. Both print their own elapsed time. Process
 startup is excluded; WrenJIT warmup and compilation are included. Each bar is
-the best of five runs. Shorter is better.</p>
+the best timing recorded in the input results. Shorter is better.</p>
 
 <p class="legend">
 <span class="swatch" style="background: var(--link)"></span>wren (jit)
@@ -90,187 +89,205 @@ the best of five runs. Shorter is better.</p>
 
 <h2>Where things stand</h2>
 
-<p>WrenJIT is faster than LuaJIT on every paired kernel in this suite. Loops use
-typed SSA traces. Exact recursive bytecode shapes use guarded native kernels.
+<p>WrenJIT is faster than LuaJIT on 1 of 10 paired kernels in this run. Loops use typed SSA traces. Exact recursive bytecode shapes use guarded native kernels.
 Range sums and alternating boolean counters are reduced as recurrences instead
 of paid one iteration at a time. A failed proof exits to the Wren interpreter.</p>
 
 <table class="summary">
 <tr><th>benchmark</th><th>wrenjit ms</th><th>luajit -joff ms</th><th>luajit ms</th><th>vs -joff</th><th>vs luajit</th></tr>
-<tr><td><code>bench_sum</code></td><td>0.641</td><td>5.910</td><td>1.092</td><td>0.11&times;</td><td>0.59&times;</td></tr>
-<tr><td><code>bench_for</code></td><td>0.074</td><td>4.693</td><td>0.584</td><td>0.02&times;</td><td>0.13&times;</td></tr>
-<tr><td><code>bench_fib</code></td><td>39.4</td><td>187.8</td><td>51.9</td><td>0.21&times;</td><td>0.76&times;</td></tr>
-<tr><td><code>bench_tak</code></td><td>2.224</td><td>15.2</td><td>6.361</td><td>0.15&times;</td><td>0.35&times;</td></tr>
-<tr><td><code>bench_ack</code></td><td>0.024</td><td>5.092</td><td>1.066</td><td>0.00&times;</td><td>0.02&times;</td></tr>
-<tr><td><code>bench_mutual</code></td><td>0.098</td><td>9.057</td><td>0.321</td><td>0.01&times;</td><td>0.31&times;</td></tr>
-<tr><td><code>bench_deep</code></td><td>0.625</td><td>10.8</td><td>6.724</td><td>0.06&times;</td><td>0.09&times;</td></tr>
-<tr><td><code>bench_trees</code></td><td>8.807</td><td>28.7</td><td>19.8</td><td>0.31&times;</td><td>0.45&times;</td></tr>
-<tr><td><code>bench_method_call</code></td><td>0.087</td><td>92.9</td><td>0.448</td><td>0.00&times;</td><td>0.19&times;</td></tr>
+<tr><td><code>benchmarksgame_fannkuch_redux</code></td><td>1789.7</td><td>1914.6</td><td>493.6</td><td>0.93&times;</td><td>3.63&times;</td></tr>
+<tr><td><code>benchmarksgame_nbody</code></td><td>848.4</td><td>367.5</td><td>31.8</td><td>2.31&times;</td><td>26.69&times;</td></tr>
+<tr><td><code>benchmarksgame_spectral_norm</code></td><td>17.0</td><td>218.7</td><td>10.2</td><td>0.08&times;</td><td>1.68&times;</td></tr>
+<tr><td><code>benchmarksgame_mandelbrot</code></td><td>68.3</td><td>255.4</td><td>21.6</td><td>0.27&times;</td><td>3.15&times;</td></tr>
+<tr><td><code>benchmarksgame_fasta</code></td><td>54.7</td><td>31.7</td><td>10.4</td><td>1.73&times;</td><td>5.25&times;</td></tr>
+<tr><td><code>benchmarksgame_k_nucleotide</code></td><td>175.4</td><td>56.7</td><td>30.9</td><td>3.09&times;</td><td>5.68&times;</td></tr>
+<tr><td><code>benchmarksgame_reverse_complement</code></td><td>12.2</td><td>20.5</td><td>7.702</td><td>0.59&times;</td><td>1.58&times;</td></tr>
+<tr><td><code>benchmarksgame_binary_trees</code></td><td>206.5</td><td>83.0</td><td>48.6</td><td>2.49&times;</td><td>4.25&times;</td></tr>
+<tr><td><code>benchmarksgame_pidigits</code></td><td>66.4</td><td>340.0</td><td>119.8</td><td>0.20&times;</td><td>0.55&times;</td></tr>
+<tr><td><code>benchmarksgame_regex_redux</code></td><td>455.9</td><td>202.1</td><td>23.9</td><td>2.26&times;</td><td>19.06&times;</td></tr>
 </table>
 
 <h2>Benchmarks</h2>
 
-<h3>bench_sum</h3>
-<p>Sums 0..999999 in a <code>while</code> loop.</p>
+<h3>benchmarksgame_fannkuch_redux</h3>
+<p>Permutation flips from the Benchmarks Game, scaled to <code>n=10</code>.</p>
 <table class="chart">
   <tr>
-    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 3.3%;">0.641ms&nbsp;</div></td>
+    <th>wren (jit)</th><td class="bar-cell"><div class="chart-bar wren-jit" style="width: 24.6%;"></div></td><td class="chart-value">1789.7ms</td>
   </tr>
   <tr>
-    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">19.2ms&nbsp;</div></td>
+    <th>wren (no jit)</th><td class="bar-cell"><div class="chart-bar wren" style="width: 100.0%;"></div></td><td class="chart-value">7282.6ms</td>
   </tr>
   <tr>
-    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 30.8%;">5.910ms&nbsp;</div></td>
+    <th>luajit (-joff)</th><td class="bar-cell"><div class="chart-bar luajit-off" style="width: 26.3%;"></div></td><td class="chart-value">1914.6ms</td>
   </tr>
   <tr>
-    <th>luajit</th><td><div class="chart-bar luajit" style="width: 5.7%;">1.092ms&nbsp;</div></td>
+    <th>luajit</th><td class="bar-cell"><div class="chart-bar luajit" style="width: 6.8%;"></div></td><td class="chart-value">493.6ms</td>
   </tr>
 </table>
-<p class="note">The JIT compiled 1 native unit.</p>
+<p class="note">The JIT compiled 3 native units and aborted 9.</p>
 
-<h3>bench_for</h3>
-<p>Sums 1..1000000 with <code>for i in 1..n</code>.</p>
+<h3>benchmarksgame_nbody</h3>
+<p>Five-body solar-system simulation, scaled to 500,000 time steps.</p>
 <table class="chart">
   <tr>
-    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 0.6%;">0.074ms&nbsp;</div></td>
+    <th>wren (jit)</th><td class="bar-cell"><div class="chart-bar wren-jit" style="width: 42.4%;"></div></td><td class="chart-value">848.4ms</td>
   </tr>
   <tr>
-    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">20.8ms&nbsp;</div></td>
+    <th>wren (no jit)</th><td class="bar-cell"><div class="chart-bar wren" style="width: 100.0%;"></div></td><td class="chart-value">2002.0ms</td>
   </tr>
   <tr>
-    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 22.6%;">4.693ms&nbsp;</div></td>
+    <th>luajit (-joff)</th><td class="bar-cell"><div class="chart-bar luajit-off" style="width: 18.4%;"></div></td><td class="chart-value">367.5ms</td>
   </tr>
   <tr>
-    <th>luajit</th><td><div class="chart-bar luajit" style="width: 2.8%;">0.584ms&nbsp;</div></td>
+    <th>luajit</th><td class="bar-cell"><div class="chart-bar luajit" style="width: 1.6%;"></div></td><td class="chart-value">31.8ms</td>
   </tr>
 </table>
-<p class="note">The JIT compiled 1 native unit.</p>
+<p class="note">The JIT compiled 2 native units and aborted 4.</p>
 
-<h3>bench_fib</h3>
-<p>Naive binary recursion, <code>fib(35)</code>. No loop in the hot path.</p>
+<h3>benchmarksgame_spectral_norm</h3>
+<p>Spectral norm of a 500-element implicit matrix.</p>
 <table class="chart">
   <tr>
-    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 5.6%;">39.4ms&nbsp;</div></td>
+    <th>wren (jit)</th><td class="bar-cell"><div class="chart-bar wren-jit" style="width: 2.6%;"></div></td><td class="chart-value">17.0ms</td>
   </tr>
   <tr>
-    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">700.5ms&nbsp;</div></td>
+    <th>wren (no jit)</th><td class="bar-cell"><div class="chart-bar wren" style="width: 100.0%;"></div></td><td class="chart-value">652.8ms</td>
   </tr>
   <tr>
-    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 26.8%;">187.8ms&nbsp;</div></td>
+    <th>luajit (-joff)</th><td class="bar-cell"><div class="chart-bar luajit-off" style="width: 33.5%;"></div></td><td class="chart-value">218.7ms</td>
   </tr>
   <tr>
-    <th>luajit</th><td><div class="chart-bar luajit" style="width: 7.4%;">51.9ms&nbsp;</div></td>
+    <th>luajit</th><td class="bar-cell"><div class="chart-bar luajit" style="width: 1.6%;"></div></td><td class="chart-value">10.2ms</td>
   </tr>
 </table>
-<p class="note">The JIT compiled 1 native unit.</p>
+<p class="note">The JIT compiled 3 native units and aborted 3.</p>
 
-<h3>bench_tak</h3>
-<p>Takeuchi function, <code>tak(24, 16, 8)</code>. Three-argument recursion, no allocation.</p>
+<h3>benchmarksgame_mandelbrot</h3>
+<p>Mandelbrot kernel at 600&times;600; output is reduced to a pixel checksum.</p>
 <table class="chart">
   <tr>
-    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 3.6%;">2.224ms&nbsp;</div></td>
+    <th>wren (jit)</th><td class="bar-cell"><div class="chart-bar wren-jit" style="width: 9.7%;"></div></td><td class="chart-value">68.3ms</td>
   </tr>
   <tr>
-    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">61.9ms&nbsp;</div></td>
+    <th>wren (no jit)</th><td class="bar-cell"><div class="chart-bar wren" style="width: 100.0%;"></div></td><td class="chart-value">701.9ms</td>
   </tr>
   <tr>
-    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 24.5%;">15.2ms&nbsp;</div></td>
+    <th>luajit (-joff)</th><td class="bar-cell"><div class="chart-bar luajit-off" style="width: 36.4%;"></div></td><td class="chart-value">255.4ms</td>
   </tr>
   <tr>
-    <th>luajit</th><td><div class="chart-bar luajit" style="width: 10.3%;">6.361ms&nbsp;</div></td>
+    <th>luajit</th><td class="bar-cell"><div class="chart-bar luajit" style="width: 3.1%;"></div></td><td class="chart-value">21.6ms</td>
   </tr>
 </table>
-<p class="note">The JIT compiled 1 native unit.</p>
+<p class="note">The JIT compiled 1 native unit and aborted 2.</p>
 
-<h3>bench_ack</h3>
-<p>Ackermann, <code>ack(3, 7)</code>. Deep recursion, little work per frame.</p>
+<h3>benchmarksgame_fasta</h3>
+<p>FASTA linear-congruential generator over 500,000 symbols; output is checksummed.</p>
 <table class="chart">
   <tr>
-    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 0.6%;">0.024ms&nbsp;</div></td>
+    <th>wren (jit)</th><td class="bar-cell"><div class="chart-bar wren-jit" style="width: 70.4%;"></div></td><td class="chart-value">54.7ms</td>
   </tr>
   <tr>
-    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">15.5ms&nbsp;</div></td>
+    <th>wren (no jit)</th><td class="bar-cell"><div class="chart-bar wren" style="width: 100.0%;"></div></td><td class="chart-value">77.6ms</td>
   </tr>
   <tr>
-    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 33.0%;">5.092ms&nbsp;</div></td>
+    <th>luajit (-joff)</th><td class="bar-cell"><div class="chart-bar luajit-off" style="width: 40.8%;"></div></td><td class="chart-value">31.7ms</td>
   </tr>
   <tr>
-    <th>luajit</th><td><div class="chart-bar luajit" style="width: 6.9%;">1.066ms&nbsp;</div></td>
+    <th>luajit</th><td class="bar-cell"><div class="chart-bar luajit" style="width: 13.4%;"></div></td><td class="chart-value">10.4ms</td>
   </tr>
 </table>
-<p class="note">The JIT compiled 1 native unit.</p>
+<p class="note">The JIT compiled 2 native units and aborted 2.</p>
 
-<h3>bench_mutual</h3>
-<p>Two static methods calling each other 500 deep, 2000 times.</p>
+<h3>benchmarksgame_k_nucleotide</h3>
+<p>K-mer counts over 250,000 deterministic bases.</p>
 <table class="chart">
   <tr>
-    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 0.6%;">0.098ms&nbsp;</div></td>
+    <th>wren (jit)</th><td class="bar-cell"><div class="chart-bar wren-jit" style="width: 100.0%;"></div></td><td class="chart-value">175.4ms</td>
   </tr>
   <tr>
-    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">16.3ms&nbsp;</div></td>
+    <th>wren (no jit)</th><td class="bar-cell"><div class="chart-bar wren" style="width: 98.5%;"></div></td><td class="chart-value">172.7ms</td>
   </tr>
   <tr>
-    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 55.7%;">9.057ms&nbsp;</div></td>
+    <th>luajit (-joff)</th><td class="bar-cell"><div class="chart-bar luajit-off" style="width: 32.4%;"></div></td><td class="chart-value">56.7ms</td>
   </tr>
   <tr>
-    <th>luajit</th><td><div class="chart-bar luajit" style="width: 2.0%;">0.321ms&nbsp;</div></td>
+    <th>luajit</th><td class="bar-cell"><div class="chart-bar luajit" style="width: 17.6%;"></div></td><td class="chart-value">30.9ms</td>
   </tr>
 </table>
-<p class="note">The JIT compiled 1 native unit and aborted 1.</p>
+<p class="note">The JIT compiled no native units and aborted 3 recording attempts.</p>
 
-<h3>bench_deep</h3>
-<p>Linear recursion 1000 frames deep, 2000 times. Isolates call and return cost.</p>
+<h3>benchmarksgame_reverse_complement</h3>
+<p>In-place reverse complement of one million encoded bases.</p>
 <table class="chart">
   <tr>
-    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 1.5%;">0.625ms&nbsp;</div></td>
+    <th>wren (jit)</th><td class="bar-cell"><div class="chart-bar wren-jit" style="width: 17.8%;"></div></td><td class="chart-value">12.2ms</td>
   </tr>
   <tr>
-    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">41.6ms&nbsp;</div></td>
+    <th>wren (no jit)</th><td class="bar-cell"><div class="chart-bar wren" style="width: 100.0%;"></div></td><td class="chart-value">68.5ms</td>
   </tr>
   <tr>
-    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 25.8%;">10.8ms&nbsp;</div></td>
+    <th>luajit (-joff)</th><td class="bar-cell"><div class="chart-bar luajit-off" style="width: 30.0%;"></div></td><td class="chart-value">20.5ms</td>
   </tr>
   <tr>
-    <th>luajit</th><td><div class="chart-bar luajit" style="width: 16.2%;">6.724ms&nbsp;</div></td>
+    <th>luajit</th><td class="bar-cell"><div class="chart-bar luajit" style="width: 11.3%;"></div></td><td class="chart-value">7.702ms</td>
   </tr>
 </table>
-<p class="note">The JIT compiled 1 native unit and aborted 1.</p>
+<p class="note">The JIT compiled 2 native units and aborted 1.</p>
 
-<h3>bench_trees</h3>
-<p>Recursion plus allocation: builds and walks depth-14 trees 12 times.</p>
+<h3>benchmarksgame_binary_trees</h3>
+<p>Binary-tree allocation and traversal through depth 14.</p>
 <table class="chart">
   <tr>
-    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 25.0%;">8.807ms&nbsp;</div></td>
+    <th>wren (jit)</th><td class="bar-cell"><div class="chart-bar wren-jit" style="width: 77.4%;"></div></td><td class="chart-value">206.5ms</td>
   </tr>
   <tr>
-    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">35.2ms&nbsp;</div></td>
+    <th>wren (no jit)</th><td class="bar-cell"><div class="chart-bar wren" style="width: 100.0%;"></div></td><td class="chart-value">266.7ms</td>
   </tr>
   <tr>
-    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 81.6%;">28.7ms&nbsp;</div></td>
+    <th>luajit (-joff)</th><td class="bar-cell"><div class="chart-bar luajit-off" style="width: 31.1%;"></div></td><td class="chart-value">83.0ms</td>
   </tr>
   <tr>
-    <th>luajit</th><td><div class="chart-bar luajit" style="width: 56.1%;">19.8ms&nbsp;</div></td>
+    <th>luajit</th><td class="bar-cell"><div class="chart-bar luajit" style="width: 18.2%;"></div></td><td class="chart-value">48.6ms</td>
   </tr>
 </table>
-<p class="note">The JIT compiled 2 native units.</p>
+<p class="note">The JIT compiled 1 native unit and aborted 2.</p>
 
-<h3>bench_method_call</h3>
-<p>Three million activate/getter calls on a user-defined class.</p>
+<h3>benchmarksgame_pidigits</h3>
+<p>Array spigot producing 2,000 digits without a bignum extension.</p>
 <table class="chart">
   <tr>
-    <th>wren (jit)</th><td><div class="chart-bar wren-jit" style="width: 0.6%;">0.087ms&nbsp;</div></td>
+    <th>wren (jit)</th><td class="bar-cell"><div class="chart-bar wren-jit" style="width: 5.6%;"></div></td><td class="chart-value">66.4ms</td>
   </tr>
   <tr>
-    <th>wren (no jit)</th><td><div class="chart-bar wren" style="width: 100.0%;">115.8ms&nbsp;</div></td>
+    <th>wren (no jit)</th><td class="bar-cell"><div class="chart-bar wren" style="width: 100.0%;"></div></td><td class="chart-value">1190.2ms</td>
   </tr>
   <tr>
-    <th>luajit (-joff)</th><td><div class="chart-bar luajit-off" style="width: 80.2%;">92.9ms&nbsp;</div></td>
+    <th>luajit (-joff)</th><td class="bar-cell"><div class="chart-bar luajit-off" style="width: 28.6%;"></div></td><td class="chart-value">340.0ms</td>
   </tr>
   <tr>
-    <th>luajit</th><td><div class="chart-bar luajit" style="width: 0.6%;">0.448ms&nbsp;</div></td>
+    <th>luajit</th><td class="bar-cell"><div class="chart-bar luajit" style="width: 10.1%;"></div></td><td class="chart-value">119.8ms</td>
   </tr>
 </table>
-<p class="note">The JIT compiled 1 native unit.</p>
+<p class="note">The JIT compiled 2 native units and aborted 22.</p>
+
+<h3>benchmarksgame_regex_redux</h3>
+<p>The nine regex-redux variant patterns using the same mask matcher in both languages.</p>
+<table class="chart">
+  <tr>
+    <th>wren (jit)</th><td class="bar-cell"><div class="chart-bar wren-jit" style="width: 85.1%;"></div></td><td class="chart-value">455.9ms</td>
+  </tr>
+  <tr>
+    <th>wren (no jit)</th><td class="bar-cell"><div class="chart-bar wren" style="width: 100.0%;"></div></td><td class="chart-value">535.6ms</td>
+  </tr>
+  <tr>
+    <th>luajit (-joff)</th><td class="bar-cell"><div class="chart-bar luajit-off" style="width: 37.7%;"></div></td><td class="chart-value">202.1ms</td>
+  </tr>
+  <tr>
+    <th>luajit</th><td class="bar-cell"><div class="chart-bar luajit" style="width: 4.5%;"></div></td><td class="chart-value">23.9ms</td>
+  </tr>
+</table>
+<p class="note">The JIT compiled 1 native unit and aborted 7.</p>
 
 <h2>What is compiled</h2>
 
@@ -281,7 +298,7 @@ Takeuchi, and binary-tree construction/traversal. This is specialization, not
 wishful inlining. Unsupported code remains ordinary Wren.</p>
 
 <div class="meta">
-<p>Measured on sysctl: sysctl fmt -1 1024 1: Operation not permitted on 2026-08-07.<br>
+<p>Measured on arm on 2026-08-08.<br>
 Wren base <code>99d2f0b</code>, LuaJIT 2.1.1785763465 -- Copyright (C) 2005-2026 Mike Pall. https://luajit.org/.<br>
 Generated by <code>bench/gen_report.py</code> from
 <code>bench/run_benchmarks.py --json</code>.

@@ -1,10 +1,15 @@
 build/
 build-jit/
 build-nojit/
+build-x64/
+build_asan/
+build_asan_o2/
+build_perf/
+build_profile/
+build_ubsan/
+Testing/
 *.o
 *.a
 *.d
 *.dylib
 *.so
-build_asan/
-build_perf/

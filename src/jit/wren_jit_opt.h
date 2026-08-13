@@ -42,5 +42,7 @@ void irOptDCE(IRBuffer* buf);
 void irOptGuardElim(IRBuffer* buf);
 void irOptIVTypeInference(IRBuffer* buf);
 void irOptFuseComparisonGuards(IRBuffer* buf);
+void irOptHoistListBounds(IRBuffer* buf);
+void irOptRelocatePostBackConstants(IRBuffer* buf);
 
 #endif // wren_jit_opt_h

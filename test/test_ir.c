@@ -329,7 +329,7 @@ TEST(test_register_pressure_spills_safely) {
 }
 
 TEST(test_unsupported_codegen_ops_are_rejected) {
-    const IROp unsupported[] = { IR_MOD, IR_CALL_C, IR_CALL_WREN };
+    const IROp unsupported[] = { IR_CALL_C, IR_CALL_WREN };
     for (size_t i = 0; i < sizeof(unsupported) / sizeof(unsupported[0]); i++) {
         IRBuffer buf;
         irBufferInit(&buf);

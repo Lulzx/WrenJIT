@@ -29,4 +29,8 @@ bool jitTryWidenCall1(WrenJitState* jit, WrenVM* vm, Value* stackStart,
 bool jitTryWidenCall0(WrenJitState* jit, WrenVM* vm, Value* stackStart,
                       uint16_t symbol, uint8_t* ip);
 
+// Inline List.[_] and List.[_]=(_) primitives with guarded native accesses.
+bool jitTryWidenCall2(WrenJitState* jit, WrenVM* vm, Value* stackStart,
+                      uint16_t symbol, uint8_t* ip);
+
 #endif // wren_jit_trace_widen_h

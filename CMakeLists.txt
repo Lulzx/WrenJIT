@@ -161,11 +161,20 @@ endif()
 
 # JIT test targets
 if(WREN_JIT)
+    # Tests rely on assert(); keep it live regardless of the build type so a
+    # Release/RelWithDebInfo (-DNDEBUG) build cannot silently skip every check.
+    set(TEST_COMPILE_OPTIONS "")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+        set(TEST_COMPILE_OPTIONS -UNDEBUG)
+    endif()
+
     add_executable(test_ir test/test_ir.c)
     target_link_libraries(test_ir PRIVATE wrenjit_vm)
+    target_compile_options(test_ir PRIVATE ${TEST_COMPILE_OPTIONS})
     add_test(NAME test_ir COMMAND test_ir)
 
     add_executable(test_jit test/test_jit.c)
     target_link_libraries(test_jit PRIVATE wrenjit_vm)
+    target_compile_options(test_jit PRIVATE ${TEST_COMPILE_OPTIONS})
     add_test(NAME test_jit COMMAND test_jit)
 endif()

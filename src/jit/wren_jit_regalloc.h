@@ -26,6 +26,8 @@ typedef struct {
     uint16_t end;           // last use (IR index)
     RegClass reg_class;     // what kind of register needed
     RegAlloc alloc;         // assigned register/spill
+    int use_count;          // live operand uses (spill-cost signal)
+    uint16_t coalesce_with; // PHI id this loop back-edge coalesces into
 } LiveRange;
 
 #define MAX_LIVE_RANGES IR_MAX_NODES
@@ -33,10 +35,12 @@ typedef struct {
 
 // Upper bounds on the register pools, used to size the tracking arrays below.
 // How many of each are actually usable depends on the target and is worked out
-// in wren_jit_regs.h.
-#define GP_SCRATCH_POOL_MAX 6
+// in wren_jit_regs.h. Scratch registers cost nothing in the prologue (they are
+// caller-saved), so the pools are sized to the big arm64 register file; smaller
+// targets clamp via WREN_JIT_MIN in wren_jit_regs.h.
+#define GP_SCRATCH_POOL_MAX 14
 #define FP_SAVED_POOL_MAX   4
-#define FP_POOL_TOTAL       10
+#define FP_POOL_TOTAL       22
 
 // Register allocator state
 typedef struct {

@@ -225,7 +225,72 @@ bool jitTryWidenCall1(WrenJitState* jit, WrenVM* vm, Value* stackStart,
         return inlineRangeIteratorValue(r, recv_slot, arg_slot, snap, arg_ssa);
     }
 
+    // ------------------------------------------------------------------
+    // List subscript getter
+    // ------------------------------------------------------------------
+    if (IS_LIST(recv_val) && IS_NUM(arg_val) &&
+        widenMethodNameEquals(vm, symbol, "[_]")) {
+        uint16_t snap = widenEmitSnapshot(r, ip);
+        uint16_t recv_ssa = widenSlotGet(r, recv_slot);
+        uint16_t arg_ssa = widenSlotGet(r, arg_slot);
+        if (recv_ssa == IR_NONE) {
+            recv_ssa = irEmitLoad(&r->ir, (uint16_t)recv_slot);
+            widenSlotSet(r, recv_slot, recv_ssa);
+        }
+        if (arg_ssa == IR_NONE) {
+            arg_ssa = irEmitLoad(&r->ir, (uint16_t)arg_slot);
+            widenSlotSet(r, arg_slot, arg_ssa);
+        }
+        irEmitGuardClass(&r->ir, recv_ssa, vm->listClass, snap);
+        irEmitGuardNum(&r->ir, arg_ssa, snap);
+        uint16_t index = irEmitUnbox(&r->ir, arg_ssa);
+        uint16_t result = irEmit(&r->ir, IR_LIST_LOAD, recv_ssa, index,
+                                 IR_TYPE_VALUE);
+        r->ir.nodes[result].imm.list.snapshot = snap;
+        r->stack_top--;
+        r->slot_live[r->stack_top] = false;
+        widenSlotSet(r, recv_slot, result);
+        return true;
+    }
+
     return false; // unsupported receiver type
+}
+
+bool jitTryWidenCall2(WrenJitState* jit, WrenVM* vm, Value* stackStart,
+                      uint16_t symbol, uint8_t* ip)
+{
+    JitRecorder* r = jitRecorderGet(jit);
+    if (!r || r->aborted || r->stack_top < 3) return false;
+
+    int recv_slot = r->stack_top - 3;
+    int index_slot = r->stack_top - 2;
+    int value_slot = r->stack_top - 1;
+    Value recv_val = stackStart[recv_slot];
+    Value index_val = stackStart[index_slot];
+    if (!IS_LIST(recv_val) || !IS_NUM(index_val) ||
+        !widenMethodNameEquals(vm, symbol, "[_]=(_)")) return false;
+
+    uint16_t snap = widenEmitSnapshot(r, ip);
+    uint16_t recv_ssa = widenSlotGet(r, recv_slot);
+    uint16_t index_ssa = widenSlotGet(r, index_slot);
+    uint16_t value_ssa = widenSlotGet(r, value_slot);
+    if (recv_ssa == IR_NONE) recv_ssa = irEmitLoad(&r->ir, (uint16_t)recv_slot);
+    if (index_ssa == IR_NONE) index_ssa = irEmitLoad(&r->ir, (uint16_t)index_slot);
+    if (value_ssa == IR_NONE) value_ssa = irEmitLoad(&r->ir, (uint16_t)value_slot);
+    irEmitGuardClass(&r->ir, recv_ssa, vm->listClass, snap);
+    irEmitGuardNum(&r->ir, index_ssa, snap);
+    uint16_t index = irEmitUnbox(&r->ir, index_ssa);
+    uint16_t store = irEmit(&r->ir, IR_LIST_STORE, recv_ssa, index,
+                            IR_TYPE_VOID);
+    r->ir.nodes[store].imm.list.value = value_ssa;
+    r->ir.nodes[store].imm.list.snapshot = snap;
+
+    // Setter returns the assigned value and consumes receiver/index.
+    r->stack_top -= 2;
+    r->slot_live[r->stack_top] = false;
+    r->slot_live[r->stack_top + 1] = false;
+    widenSlotSet(r, recv_slot, value_ssa);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +304,21 @@ bool jitTryWidenCall0(WrenJitState* jit, WrenVM* vm, Value* stackStart,
 
     int recv_slot = r->stack_top - 1;
     Value recv_val = stackStart[recv_slot];
+
+    if (IS_LIST(recv_val) && widenMethodNameEquals(vm, symbol, "count")) {
+        uint16_t snap = widenEmitSnapshot(r, ip);
+        uint16_t recv_ssa = widenSlotGet(r, recv_slot);
+        if (recv_ssa == IR_NONE) {
+            recv_ssa = irEmitLoad(&r->ir, (uint16_t)recv_slot);
+            widenSlotSet(r, recv_slot, recv_ssa);
+        }
+        irEmitGuardClass(&r->ir, recv_ssa, vm->listClass, snap);
+        uint16_t count = irEmit(&r->ir, IR_LIST_COUNT, recv_ssa, IR_NONE,
+                                IR_TYPE_NUM);
+        widenSlotSet(r, recv_slot, irEmitBox(&r->ir, count));
+        return true;
+    }
+
     if (!IS_INSTANCE(recv_val)) return false;
 
     ObjInstance* instance = AS_INSTANCE(recv_val);

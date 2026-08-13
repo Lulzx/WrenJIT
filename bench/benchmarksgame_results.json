@@ -1,0 +1,362 @@
+[
+  {
+    "benchmark": "benchmarksgame_fannkuch_redux",
+    "no-jit": {
+      "label": "benchmarksgame_fannkuch_redux",
+      "path": "bench/benchmarksgame_fannkuch_redux.wren",
+      "mode": "no-jit",
+      "best_seconds": 7.12413,
+      "median_seconds": 7.147179,
+      "mean_seconds": 7.1396836,
+      "stdev_seconds": 0.010813912143160841,
+      "best_trial": 5,
+      "traces_compiled": 0,
+      "traces_aborted": 0,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "jit": {
+      "label": "benchmarksgame_fannkuch_redux",
+      "path": "bench/benchmarksgame_fannkuch_redux.wren",
+      "mode": "jit",
+      "best_seconds": 11.429919,
+      "median_seconds": 11.470073,
+      "mean_seconds": 11.5267886,
+      "stdev_seconds": 0.1094178145360252,
+      "best_trial": 1,
+      "traces_compiled": 3,
+      "traces_aborted": 9,
+      "total_exits": 30219029,
+      "abort_reasons": []
+    },
+    "speedup": 0.6232878815676647,
+    "luajit": {
+      "off": 1.692205,
+      "on": 0.439831
+    }
+  },
+  {
+    "benchmark": "benchmarksgame_nbody",
+    "no-jit": {
+      "label": "benchmarksgame_nbody",
+      "path": "bench/benchmarksgame_nbody.wren",
+      "mode": "no-jit",
+      "best_seconds": 1.890033,
+      "median_seconds": 1.892316,
+      "mean_seconds": 1.8961036,
+      "stdev_seconds": 0.006411756595504822,
+      "best_trial": 1,
+      "traces_compiled": 0,
+      "traces_aborted": 0,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "jit": {
+      "label": "benchmarksgame_nbody",
+      "path": "bench/benchmarksgame_nbody.wren",
+      "mode": "jit",
+      "best_seconds": 1.365783,
+      "median_seconds": 1.415406,
+      "mean_seconds": 1.4044802,
+      "stdev_seconds": 0.02387669862774166,
+      "best_trial": 3,
+      "traces_compiled": 2,
+      "traces_aborted": 4,
+      "total_exits": 2499970,
+      "abort_reasons": []
+    },
+    "speedup": 1.383845750020318,
+    "luajit": {
+      "off": 0.402547,
+      "on": 0.032197
+    }
+  },
+  {
+    "benchmark": "benchmarksgame_spectral_norm",
+    "no-jit": {
+      "label": "benchmarksgame_spectral_norm",
+      "path": "bench/benchmarksgame_spectral_norm.wren",
+      "mode": "no-jit",
+      "best_seconds": 0.642586,
+      "median_seconds": 0.644601,
+      "mean_seconds": 0.6455078,
+      "stdev_seconds": 0.0021887177433374022,
+      "best_trial": 3,
+      "traces_compiled": 0,
+      "traces_aborted": 0,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "jit": {
+      "label": "benchmarksgame_spectral_norm",
+      "path": "bench/benchmarksgame_spectral_norm.wren",
+      "mode": "jit",
+      "best_seconds": 0.015066,
+      "median_seconds": 0.015115,
+      "mean_seconds": 0.0151568,
+      "stdev_seconds": 9.9796593128223e-05,
+      "best_trial": 2,
+      "traces_compiled": 3,
+      "traces_aborted": 3,
+      "total_exits": 20450,
+      "abort_reasons": []
+    },
+    "speedup": 42.6514005044471,
+    "luajit": {
+      "off": 0.23564,
+      "on": 0.010761
+    }
+  },
+  {
+    "benchmark": "benchmarksgame_mandelbrot",
+    "no-jit": {
+      "label": "benchmarksgame_mandelbrot",
+      "path": "bench/benchmarksgame_mandelbrot.wren",
+      "mode": "no-jit",
+      "best_seconds": 0.696333,
+      "median_seconds": 0.696993,
+      "mean_seconds": 0.6996456,
+      "stdev_seconds": 0.004475079065223342,
+      "best_trial": 3,
+      "traces_compiled": 0,
+      "traces_aborted": 0,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "jit": {
+      "label": "benchmarksgame_mandelbrot",
+      "path": "bench/benchmarksgame_mandelbrot.wren",
+      "mode": "jit",
+      "best_seconds": 0.143869,
+      "median_seconds": 0.147442,
+      "mean_seconds": 0.1470322,
+      "stdev_seconds": 0.0018764430606868917,
+      "best_trial": 1,
+      "traces_compiled": 1,
+      "traces_aborted": 2,
+      "total_exits": 359983,
+      "abort_reasons": []
+    },
+    "speedup": 4.840048933404694,
+    "luajit": {
+      "off": 0.25795,
+      "on": 0.021417
+    }
+  },
+  {
+    "benchmark": "benchmarksgame_fasta",
+    "no-jit": {
+      "label": "benchmarksgame_fasta",
+      "path": "bench/benchmarksgame_fasta.wren",
+      "mode": "no-jit",
+      "best_seconds": 0.075173,
+      "median_seconds": 0.076168,
+      "mean_seconds": 0.0760902,
+      "stdev_seconds": 0.0005823742439359727,
+      "best_trial": 4,
+      "traces_compiled": 0,
+      "traces_aborted": 0,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "jit": {
+      "label": "benchmarksgame_fasta",
+      "path": "bench/benchmarksgame_fasta.wren",
+      "mode": "jit",
+      "best_seconds": 0.182249,
+      "median_seconds": 0.188635,
+      "mean_seconds": 0.188361,
+      "stdev_seconds": 0.003518234557274433,
+      "best_trial": 4,
+      "traces_compiled": 2,
+      "traces_aborted": 2,
+      "total_exits": 730153,
+      "abort_reasons": []
+    },
+    "speedup": 0.41247414251930054,
+    "luajit": {
+      "off": 0.033018,
+      "on": 0.010171
+    }
+  },
+  {
+    "benchmark": "benchmarksgame_k_nucleotide",
+    "no-jit": {
+      "label": "benchmarksgame_k_nucleotide",
+      "path": "bench/benchmarksgame_k_nucleotide.wren",
+      "mode": "no-jit",
+      "best_seconds": 0.176091,
+      "median_seconds": 0.177746,
+      "mean_seconds": 0.1780542,
+      "stdev_seconds": 0.0015478342805352275,
+      "best_trial": 4,
+      "traces_compiled": 0,
+      "traces_aborted": 0,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "jit": {
+      "label": "benchmarksgame_k_nucleotide",
+      "path": "bench/benchmarksgame_k_nucleotide.wren",
+      "mode": "jit",
+      "best_seconds": 0.179066,
+      "median_seconds": 0.180874,
+      "mean_seconds": 0.1815054,
+      "stdev_seconds": 0.0018789875571700871,
+      "best_trial": 3,
+      "traces_compiled": 0,
+      "traces_aborted": 3,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "speedup": 0.9833860140953614,
+    "luajit": {
+      "off": 0.059617,
+      "on": 0.030201
+    }
+  },
+  {
+    "benchmark": "benchmarksgame_reverse_complement",
+    "no-jit": {
+      "label": "benchmarksgame_reverse_complement",
+      "path": "bench/benchmarksgame_reverse_complement.wren",
+      "mode": "no-jit",
+      "best_seconds": 0.067558,
+      "median_seconds": 0.068207,
+      "mean_seconds": 0.068347,
+      "stdev_seconds": 0.0008325375667199616,
+      "best_trial": 1,
+      "traces_compiled": 0,
+      "traces_aborted": 0,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "jit": {
+      "label": "benchmarksgame_reverse_complement",
+      "path": "bench/benchmarksgame_reverse_complement.wren",
+      "mode": "jit",
+      "best_seconds": 0.006003,
+      "median_seconds": 0.006109,
+      "mean_seconds": 0.0060974,
+      "stdev_seconds": 5.313605179160394e-05,
+      "best_trial": 2,
+      "traces_compiled": 2,
+      "traces_aborted": 1,
+      "total_exits": 2,
+      "abort_reasons": []
+    },
+    "speedup": 11.254039646843246,
+    "luajit": {
+      "off": 0.020901,
+      "on": 0.007635
+    }
+  },
+  {
+    "benchmark": "benchmarksgame_binary_trees",
+    "no-jit": {
+      "label": "benchmarksgame_binary_trees",
+      "path": "bench/benchmarksgame_binary_trees.wren",
+      "mode": "no-jit",
+      "best_seconds": 0.269661,
+      "median_seconds": 0.27069,
+      "mean_seconds": 0.271282,
+      "stdev_seconds": 0.0016152056215850731,
+      "best_trial": 5,
+      "traces_compiled": 0,
+      "traces_aborted": 0,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "jit": {
+      "label": "benchmarksgame_binary_trees",
+      "path": "bench/benchmarksgame_binary_trees.wren",
+      "mode": "jit",
+      "best_seconds": 0.208772,
+      "median_seconds": 0.209805,
+      "mean_seconds": 0.2107242,
+      "stdev_seconds": 0.0017523736359578129,
+      "best_trial": 5,
+      "traces_compiled": 1,
+      "traces_aborted": 2,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "speedup": 1.2916530952426568,
+    "luajit": {
+      "off": 0.085837,
+      "on": 0.048401
+    }
+  },
+  {
+    "benchmark": "benchmarksgame_pidigits",
+    "no-jit": {
+      "label": "benchmarksgame_pidigits",
+      "path": "bench/benchmarksgame_pidigits.wren",
+      "mode": "no-jit",
+      "best_seconds": 1.191944,
+      "median_seconds": 1.201311,
+      "mean_seconds": 1.2017672,
+      "stdev_seconds": 0.006360992482309703,
+      "best_trial": 1,
+      "traces_compiled": 0,
+      "traces_aborted": 0,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "jit": {
+      "label": "benchmarksgame_pidigits",
+      "path": "bench/benchmarksgame_pidigits.wren",
+      "mode": "jit",
+      "best_seconds": 0.066292,
+      "median_seconds": 0.066706,
+      "mean_seconds": 0.0665964,
+      "stdev_seconds": 0.00021774351884728974,
+      "best_trial": 3,
+      "traces_compiled": 2,
+      "traces_aborted": 22,
+      "total_exits": 2137,
+      "abort_reasons": []
+    },
+    "speedup": 17.98020877330598,
+    "luajit": {
+      "off": 0.33664,
+      "on": 0.117902
+    }
+  },
+  {
+    "benchmark": "benchmarksgame_regex_redux",
+    "no-jit": {
+      "label": "benchmarksgame_regex_redux",
+      "path": "bench/benchmarksgame_regex_redux.wren",
+      "mode": "no-jit",
+      "best_seconds": 0.518499,
+      "median_seconds": 0.525033,
+      "mean_seconds": 0.5232662,
+      "stdev_seconds": 0.003137488129061186,
+      "best_trial": 2,
+      "traces_compiled": 0,
+      "traces_aborted": 0,
+      "total_exits": 0,
+      "abort_reasons": []
+    },
+    "jit": {
+      "label": "benchmarksgame_regex_redux",
+      "path": "bench/benchmarksgame_regex_redux.wren",
+      "mode": "jit",
+      "best_seconds": 0.76529,
+      "median_seconds": 0.771716,
+      "mean_seconds": 0.7707588,
+      "stdev_seconds": 0.0038031266820867013,
+      "best_trial": 5,
+      "traces_compiled": 1,
+      "traces_aborted": 7,
+      "total_exits": 1374018,
+      "abort_reasons": []
+    },
+    "speedup": 0.6775196330802703,
+    "luajit": {
+      "off": 0.201891,
+      "on": 0.024573
+    }
+  }
+]

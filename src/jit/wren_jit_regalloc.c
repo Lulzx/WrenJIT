@@ -1,6 +1,7 @@
 #include "wren_jit_regalloc.h"
 #include "wren_jit_regs.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -145,63 +146,123 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
     uint16_t range_end[IR_MAX_NODES];
     uint16_t range_start[IR_MAX_NODES];
     RegClass rclass[IR_MAX_NODES];
+    int use_count[IR_MAX_NODES];
+    uint16_t first_use[IR_MAX_NODES];
 
-    memset(defined,      0, sizeof(bool)    * buf->count);
-    memset(range_end,    0, sizeof(uint16_t) * buf->count);
-    memset(range_start,  0, sizeof(uint16_t) * buf->count);
-    memset(rclass,       0, sizeof(RegClass) * buf->count);
+    memset(defined,      0, sizeof(bool)      * buf->count);
+    memset(range_end,    0, sizeof(uint16_t)  * buf->count);
+    memset(range_start,  0, sizeof(uint16_t)  * buf->count);
+    memset(rclass,       0, sizeof(RegClass)  * buf->count);
+    memset(use_count,    0, sizeof(int)       * buf->count);
+    for (uint16_t _k = 0; _k < buf->count; _k++) first_use[_k] = IR_NONE;
 
     // Pass 1: Walk IR nodes forward, record definition points and extend
     //         live ranges for operand uses.
+    bool in_loop = false;  // set once we pass IR_LOOP_HEADER
     for (uint16_t i = 0; i < buf->count; i++) {
         const IRNode* n = &buf->nodes[i];
 
+        if (n->op == IR_LOOP_HEADER)
+            in_loop = true;
+
         // Skip dead nodes.
-        if (n->flags & IR_FLAG_DEAD)
+        if (n->flags & (IR_FLAG_DEAD | IR_FLAG_SNAPSHOT_ONLY_BOX))
             continue;
 
-        // Skip nodes that don't produce a usable value.
-        if (n->op == IR_NOP || n->op == IR_STORE_STACK ||
-            n->op == IR_STORE_FIELD || n->op == IR_STORE_MODULE_VAR ||
-            n->op == IR_LOOP_HEADER || n->op == IR_LOOP_BACK ||
-            n->op == IR_SIDE_EXIT || n->op == IR_SNAPSHOT)
+        // Nodes that neither produce a value nor read any SSA operand at
+        // codegen: skip entirely (no definition, no operand extension).
+        if (n->op == IR_NOP || n->op == IR_LOOP_HEADER ||
+            n->op == IR_LOOP_BACK || n->op == IR_SIDE_EXIT ||
+            n->op == IR_SNAPSHOT || n->op == IR_LIST_BOUNDS_GUARD)
             continue;
 
-        uint16_t id = n->id;
-        if (id >= buf->count)
-            continue;
+        // Store nodes produce no register value but DO read op1 at codegen
+        // (STORE_STACK writes op1 to a slot; STORE_FIELD/STORE_MODULE_VAR
+        // likewise). A stored value must stay live until its store, or a
+        // pre-header value hoisted into a register can have that register
+        // handed to a later value before the store executes. Record the
+        // definition only for nodes that actually produce a value.
+        bool produces_value = !(n->op == IR_STORE_STACK ||
+            n->op == IR_STORE_FIELD || n->op == IR_STORE_MODULE_VAR);
 
-        // Record definition.
-        if (!defined[id]) {
-            defined[id] = true;
-            range_start[id] = i;
-            range_end[id] = i;
-            rclass[id] = classifyRegClass(n->type);
+        if (produces_value) {
+            uint16_t id = n->id;
+            if (id >= buf->count)
+                continue;
+
+            // Record definition.
+            if (!defined[id]) {
+                defined[id] = true;
+                range_start[id] = i;
+                range_end[id] = i;
+                rclass[id] = classifyRegClass(n->type);
+            }
         }
 
-        // Extend live ranges for operands.
-        if (n->op1 != IR_NONE && n->op1 < buf->count && defined[n->op1]) {
-            if (i > range_end[n->op1])
-                range_end[n->op1] = i;
+        // Extend live ranges for operands and count live uses. Snapshot entry
+        // references are deliberately NOT counted: they only fire on the cold
+        // deopt path, so a value held solely for snapshot reconstruction is the
+        // cheapest to spill when registers run out.
+        if (n->op1 != IR_NONE && n->op1 < buf->count) {
+            if (first_use[n->op1] == IR_NONE) first_use[n->op1] = i;
+            if (defined[n->op1]) {
+                if (i > range_end[n->op1])
+                    range_end[n->op1] = i;
+                if (in_loop) use_count[n->op1]++;
+            }
         }
-        if (n->op2 != IR_NONE && n->op2 < buf->count && defined[n->op2]) {
-            if (i > range_end[n->op2])
-                range_end[n->op2] = i;
+        if (n->op2 != IR_NONE && n->op2 < buf->count) {
+            if (first_use[n->op2] == IR_NONE) first_use[n->op2] = i;
+            if (defined[n->op2]) {
+                if (i > range_end[n->op2])
+                    range_end[n->op2] = i;
+                if (in_loop) use_count[n->op2]++;
+            }
         }
         if (n->op == IR_TOGGLE_COUNT_BULK) {
             uint16_t hidden[3] = { n->imm.bulk.limit, n->imm.bulk.state,
                                    n->imm.bulk.object };
             for (int h = 0; h < 3; h++) {
                 uint16_t ref = hidden[h];
-                if (ref < buf->count && defined[ref] && i > range_end[ref])
+                if (ref < buf->count && defined[ref] && i > range_end[ref]) {
                     range_end[ref] = i;
+                    if (in_loop) use_count[ref]++;
+                }
             }
         }
         if (n->op == IR_RANGE_SUM_BULK) {
             uint16_t ref = n->imm.arith.limit;
-            if (ref < buf->count && defined[ref] && i > range_end[ref])
+            if (ref < buf->count && defined[ref] && i > range_end[ref]) {
                 range_end[ref] = i;
+                if (in_loop) use_count[ref]++;
+            }
         }
+        if (n->op == IR_LIST_STORE) {
+            uint16_t ref = n->imm.list.value;
+            if (ref < buf->count && defined[ref] && i > range_end[ref]) {
+                range_end[ref] = i;
+                if (in_loop) use_count[ref]++;
+            }
+        }
+    }
+
+    // Pass 1b: Fix up forward-referenced constants. Strength-reduction rewrites
+    // `x / C` -> `x * (1/C)` (and friends) by appending a fresh reciprocal /
+    // shift / mask constant at the END of the buffer, so a constant's definition
+    // index can exceed the index of the op that uses it. Pass 1 saw the use
+    // before the definition and left the range as [def, def]; without a range
+    // covering the use, the allocator hands the constant a register (or spill
+    // slot) that another live value still occupies at the use site. The codegen
+    // materializes such constants at their first use, so [first_use, def] is the
+    // correct live range.
+    for (uint16_t i = 0; i < buf->count; i++) {
+        if (!defined[i] || first_use[i] == IR_NONE) continue;
+        IROp op = buf->nodes[i].op;
+        if (op != IR_CONST_NUM && op != IR_CONST_INT &&
+            op != IR_CONST_BOOL && op != IR_CONST_NULL &&
+            op != IR_CONST_OBJ) continue;
+        if (first_use[i] < range_start[i])
+            range_start[i] = first_use[i];
     }
 
     // Pass 2: Extend snapshot entries' live ranges.
@@ -223,6 +284,12 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
                    n->op == IR_GUARD_FALSE || n->op == IR_GUARD_NOT_NULL ||
                    (n->flags & IR_FLAG_INT_GUARD)) {
             sid = n->imm.snapshot_id;
+        } else if (n->op == IR_LIST_LOAD || n->op == IR_LIST_STORE) {
+            sid = n->imm.list.snapshot;
+        } else if (n->op == IR_LOOP_EXIT) {
+            // The deopt snapshot on the truthy path of a loop recorded at its
+            // final iteration.
+            sid = n->imm.jump.snapshot;
         }
         if (sid != IR_NONE && sid < buf->snapshot_count && i > last_exit_for_snap[sid])
             last_exit_for_snap[sid] = i;
@@ -238,6 +305,9 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
             if (entry_idx >= buf->snapshot_entry_count)
                 break;
             uint16_t ref = buf->snapshot_entries[entry_idx].ssa_ref;
+            if (ref < buf->count &&
+                (buf->nodes[ref].flags & IR_FLAG_SNAPSHOT_ONLY_BOX))
+                ref = buf->nodes[ref].op1;
             if (ref < buf->count && defined[ref]) {
                 if (last_exit > range_end[ref])
                     range_end[ref] = last_exit;
@@ -259,16 +329,17 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
 
     // Pass 3: Handle PHI nodes - their live ranges span from the loop header
     //         to the loop back edge (or end of buffer).
+    // With nested loops the LAST LOOP_BACK is the anchor's back edge (nested
+    // loops close before it), so scan for the last one rather than breaking on
+    // the first.
     uint16_t loop_header = IR_NONE;
     uint16_t loop_end = buf->count > 0 ? buf->count - 1 : 0;
     for (uint16_t i = 0; i < buf->count; i++) {
         const IRNode* n = &buf->nodes[i];
         if (n->op == IR_LOOP_HEADER && loop_header == IR_NONE)
             loop_header = i;
-        if (n->op == IR_LOOP_BACK) {
+        if (n->op == IR_LOOP_BACK)
             loop_end = i;
-            break;
-        }
     }
 
     // Pre-header integer-conversion guards are emitted at LOOP_HEADER after
@@ -308,19 +379,60 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
     }
 
     // Pass 4: Extend loop-spanning ranges.
-    // Any value defined before the loop header but used inside the loop body
+    // Any value defined before a loop header but used inside that loop's body
     // must remain live until loop_end — the loop executes multiple iterations,
     // so the register must not be reused by another value mid-loop.
+    //
+    // This must apply to EVERY loop header, not just the first (outer) one.
+    // With a nested loop, a value hoisted between the outer header and the
+    // nested header (e.g. the constant 0.01 in nbody's peeled force loop,
+    // defined after the outer header but used inside the nested loop) has a
+    // range that crosses the nested header without spanning the first one, and
+    // would otherwise be clobbered on the nested loop's second iteration.
     if (loop_header != IR_NONE) {
-        for (uint16_t id = 0; id < buf->count; id++) {
-            if (!defined[id])
-                continue;
-            // Defined before (or at) the loop header, used inside the loop.
-            if (range_start[id] <= loop_header &&
-                range_end[id] >= loop_header &&
-                range_end[id] < loop_end) {
-                range_end[id] = loop_end;
+        for (uint16_t h = 0; h < buf->count; h++) {
+            const IRNode* hn = &buf->nodes[h];
+            if (hn->op != IR_LOOP_HEADER) continue;
+            for (uint16_t id = 0; id < buf->count; id++) {
+                if (!defined[id])
+                    continue;
+                // Defined before (or at) this loop header, used inside the
+                // loop, not already live to loop_end.
+                if (range_start[id] <= h &&
+                    range_end[id] >= h &&
+                    range_end[id] < loop_end) {
+                    range_end[id] = loop_end;
+                }
             }
+        }
+    }
+
+    // Pass 5: Loop back-edge coalescing. The codegen folds a back-edge value
+    // into its PHI's register (in-place `phi = phi + step`) when the PHI is not
+    // used after the back-edge, so such values must not consume a register of
+    // their own — allocating one wastes pressure and the codegen overrides it.
+    // Must mirror wren_jit_codegen.c's coalescing condition exactly.
+    uint16_t coalesce[IR_MAX_NODES];
+    for (uint16_t c = 0; c < buf->count; c++) coalesce[c] = IR_NONE;
+    if (loop_header != IR_NONE) {
+        for (uint16_t p = 0; p < loop_header && p < buf->count; p++) {
+            const IRNode* phi = &buf->nodes[p];
+            uint16_t back = phi->op2;
+            if ((phi->flags & IR_FLAG_DEAD) || phi->op != IR_PHI ||
+                back == IR_NONE || back >= buf->count || back <= phi->id ||
+                buf->nodes[back].type != phi->type) continue;
+            bool phiUsedAfterBackedge = false;
+            for (uint16_t i = (uint16_t)(back + 1); i < buf->count; i++) {
+                const IRNode* n = &buf->nodes[i];
+                if ((n->flags & IR_FLAG_DEAD) || n->op == IR_LOOP_BACK) continue;
+                if (n->op1 == phi->id ||
+                    (n->op != IR_GUARD_CLASS && n->op2 == phi->id)) {
+                    phiUsedAfterBackedge = true;
+                    break;
+                }
+            }
+            if (!phiUsedAfterBackedge)
+                coalesce[back] = phi->id;
         }
     }
 
@@ -336,6 +448,8 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
         lr->end = range_end[id];
         lr->reg_class = rclass[id];
         memset(&lr->alloc, 0, sizeof(lr->alloc));
+        lr->use_count = use_count[id];
+        lr->coalesce_with = coalesce[id];
         state->num_ranges++;
 
         if (state->num_ranges >= MAX_LIVE_RANGES)
@@ -404,8 +518,11 @@ static void expireOldIntervals(RegAllocState* state, ActiveSet* active,
     }
 }
 
-// Spill the active range with the furthest end point to make room.
-// The range with the furthest end is the last element (sorted ascending).
+// Spill the active range with the lowest spill cost to make room. Spill cost
+// is the number of live operand uses: a value referenced once, or held only for
+// cold snapshot reconstruction, is far cheaper to reload than a loop-carried
+// value used every iteration. Ties fall back to the furthest end point (the
+// classic linear-scan choice) so equal-cost ranges keep their old behaviour.
 static void spillAtInterval(RegAllocState* state, ActiveSet* active,
                             LiveRange* current)
 {
@@ -415,14 +532,22 @@ static void spillAtInterval(RegAllocState* state, ActiveSet* active,
         return;
     }
 
-    // Find the active range with the furthest end point in the same class.
+    // Find the cheapest same-class active range to spill.
     int spill_pos = -1;
-    for (int i = active->count - 1; i >= 0; i--) {
+    for (int i = 0; i < active->count; i++) {
         int ri = active->indices[i];
-        LiveRange* candidate = &state->ranges[ri];
-        if (candidate->reg_class == current->reg_class) {
+        const LiveRange* candidate = &state->ranges[ri];
+        if (candidate->reg_class != current->reg_class)
+            continue;
+        if (spill_pos == -1) {
             spill_pos = i;
-            break;
+            continue;
+        }
+        const LiveRange* best = &state->ranges[active->indices[spill_pos]];
+        if (candidate->use_count < best->use_count ||
+            (candidate->use_count == best->use_count &&
+             candidate->end < best->end)) {
+            spill_pos = i;
         }
     }
 
@@ -435,23 +560,28 @@ static void spillAtInterval(RegAllocState* state, ActiveSet* active,
     int spill_ri = active->indices[spill_pos];
     LiveRange* spill = &state->ranges[spill_ri];
 
-    if (spill->end > current->end) {
-        // Spill the active range; give its register to current.
-        current->alloc = spill->alloc;
-        state->ssa_to_reg[current->ssa_id] = current->alloc;
-
-        // The spilled range gets a stack slot.
-        spill->alloc = makeSpill(state, spill->reg_class);
-        state->ssa_to_reg[spill->ssa_id] = spill->alloc;
-
-        // The caller inserts the current range after spillAtInterval returns.
-        // Do not insert a dummy entry here: activeInsert dereferences its range
-        // array while ordering and can crash whenever the active set is nonempty.
-        activeRemove(active, spill_pos);
-    } else {
-        // Current has a further or equal end; spill current.
+    // If the cheapest candidate is no cheaper than current but outlives it
+    // (or dies with it), spill current instead: current dies sooner or equal,
+    // so its reloads are fewer. (A strictly cheaper candidate is always stolen,
+    // even if longer-lived — e.g. a preheader-only value is worth reloading
+    // never, not per iteration.)
+    if (spill->end >= current->end && spill->use_count >= current->use_count) {
         current->alloc = makeSpill(state, current->reg_class);
+        return;
     }
+
+    // Spill the active range; give its register to current.
+    current->alloc = spill->alloc;
+    state->ssa_to_reg[current->ssa_id] = current->alloc;
+
+    // The spilled range gets a stack slot.
+    spill->alloc = makeSpill(state, spill->reg_class);
+    state->ssa_to_reg[spill->ssa_id] = spill->alloc;
+
+    // The caller inserts the current range after spillAtInterval returns.
+    // Do not insert a dummy entry here: activeInsert dereferences its range
+    // array while ordering and can crash whenever the active set is nonempty.
+    activeRemove(active, spill_pos);
 }
 
 void regAllocRun(RegAllocState* state)
@@ -462,8 +592,30 @@ void regAllocRun(RegAllocState* state)
     for (int i = 0; i < state->num_ranges; i++) {
         LiveRange* lr = &state->ranges[i];
 
+        if (getenv("WREN_JIT_DUMP_RA") && i < 3) {
+            fprintf(stderr, "PROC %d id=%d start=%u end=%u class=%d free=[%d%d%d%d%d%d%d%d%d%d]\n",
+                    i, lr->ssa_id, lr->start, lr->end, (int)lr->reg_class,
+                    state->gp_scratch_free[0], state->gp_scratch_free[1],
+                    state->gp_scratch_free[2], state->gp_scratch_free[3],
+                    state->gp_scratch_free[4], state->gp_scratch_free[5],
+                    state->gp_scratch_free[6], state->gp_scratch_free[7],
+                    state->gp_scratch_free[8], state->gp_scratch_free[9]);
+        }
+
         // Expire old intervals.
         expireOldIntervals(state, &active, lr->start);
+
+        // Loop back-edge values that the codegen coalesces into their PHI's
+        // register do not own a register: share the PHI's allocation and skip.
+        // The PHI (defined pre-loop) is always allocated before this range.
+        if (lr->coalesce_with != IR_NONE) {
+            uint16_t phi = lr->coalesce_with;
+            lr->alloc = (phi < (uint16_t)state->ssa_count)
+                ? state->ssa_to_reg[phi] : makeSpill(state, lr->reg_class);
+            if (lr->ssa_id < (uint16_t)state->ssa_count)
+                state->ssa_to_reg[lr->ssa_id] = lr->alloc;
+            continue;
+        }
 
         // Try to allocate a register.
         int reg = -1;
@@ -478,6 +630,8 @@ void regAllocRun(RegAllocState* state)
             lr->alloc.is_spill = false;
             lr->alloc.loc.reg = reg;
             lr->alloc.reg_class = lr->reg_class;
+            if (getenv("WREN_JIT_DUMP_RA") && i < 3)
+                fprintf(stderr, "  got reg %d for id %d\n", reg, lr->ssa_id);
         } else {
             // Need to spill.
             spillAtInterval(state, &active, lr);
@@ -499,6 +653,19 @@ void regAllocRun(RegAllocState* state)
             state->ssa_to_reg[lr->ssa_id] = lr->alloc;
 
         activeInsert(&active, i, state->ranges);
+    }
+
+    // DEBUG: dump allocations
+    if (getenv("WREN_JIT_DUMP_RA")) {
+        for (int i = 0; i < state->num_ranges; i++) {
+            LiveRange* r = &state->ranges[i];
+            fprintf(stderr, "ra %4d start=%4u end=%4u uc=%d co=%u class=%s -> %s %d\n",
+                    r->ssa_id, r->start, r->end, r->use_count, r->coalesce_with,
+                    r->reg_class == REG_CLASS_GP ? "gp" : "fp",
+                    r->alloc.is_spill ? "spill" : "reg",
+                    r->alloc.is_spill ? r->alloc.loc.spill_slot : r->alloc.loc.reg);
+        }
+        fprintf(stderr, "ssa_count=%d num_ranges=%d\n", state->ssa_count, state->num_ranges);
     }
 }
 
