@@ -44,7 +44,8 @@ static inline bool isGuard(IROp op)
     return op == IR_GUARD_NUM    || op == IR_GUARD_BOOL ||
            op == IR_GUARD_CLASS ||
            op == IR_GUARD_TRUE   || op == IR_GUARD_FALSE ||
-           op == IR_GUARD_NOT_NULL || op == IR_GUARD_RANGE;
+           op == IR_GUARD_NOT_NULL || op == IR_GUARD_NUM_OR_NULL ||
+           op == IR_GUARD_RANGE;
 }
 
 // Return the deoptimization snapshot used by a guard/exit node.
@@ -54,7 +55,8 @@ static uint16_t exitSnapshotId(const IRNode* n)
     if (n->op == IR_SIDE_EXIT || n->op == IR_GUARD_NUM ||
         n->op == IR_GUARD_BOOL ||
         n->op == IR_GUARD_TRUE || n->op == IR_GUARD_FALSE ||
-        n->op == IR_GUARD_NOT_NULL || n->op == IR_GUARD_RANGE)
+        n->op == IR_GUARD_NOT_NULL || n->op == IR_GUARD_NUM_OR_NULL ||
+        n->op == IR_GUARD_RANGE)
         return n->imm.snapshot_id;
     if (n->op == IR_LOOP_EXIT)
         return n->imm.jump.snapshot;
@@ -73,7 +75,9 @@ static bool hasSideEffect(const IRNode* n)
     switch (n->op) {
         case IR_STORE_STACK:
         case IR_STORE_FIELD:
+        case IR_LIST_ITERATE:
         case IR_LIST_STORE:
+        case IR_MAP_PUT:
         case IR_STORE_MODULE_VAR:
         case IR_GUARD_NUM:
         case IR_GUARD_BOOL:
@@ -81,6 +85,7 @@ static bool hasSideEffect(const IRNode* n)
         case IR_GUARD_TRUE:
         case IR_GUARD_FALSE:
         case IR_GUARD_NOT_NULL:
+        case IR_GUARD_NUM_OR_NULL:
         case IR_SIDE_EXIT:
         case IR_SNAPSHOT:
         case IR_CALL_C:
@@ -151,6 +156,24 @@ static void replaceUses(IRBuffer* buf, uint16_t old, uint16_t rep)
     }
 }
 
+// replaceUses plus the value references stored in imm fields (LIST_STORE's
+// stored value, MAP_PUT's stored value). Passes that move or fold a node must
+// rewrite those too, or the map probe reads a killed node's register.
+static void replaceUsesAndImm(IRBuffer* buf, uint16_t old, uint16_t rep)
+{
+    replaceUses(buf, old, rep);
+    for (uint16_t i = 0; i < buf->count; i++) {
+        IRNode* n = &buf->nodes[i];
+        if (n->flags & IR_FLAG_DEAD) continue;
+        if (n->op == IR_LIST_STORE && n->imm.list.value == old)
+            n->imm.list.value = rep;
+        if (n->op == IR_MAP_PUT && n->imm.map.value == old)
+            n->imm.map.value = rep;
+        if (n->op == IR_SELECT_NULL && n->imm.select.value == old)
+            n->imm.select.value = rep;
+    }
+}
+
 // Find the index of IR_LOOP_HEADER, or IR_NONE if absent.
 static uint16_t findLoopHeader(const IRBuffer* buf)
 {
@@ -187,9 +210,23 @@ static uint16_t findLoopBack(const IRBuffer* buf)
 // ===========================================================================
 void irOptBoxUnboxElim(IRBuffer* buf)
 {
+    // A box that feeds the inline map probe (as a key or stored value) must
+    // never be eliminated: the probe reads its SSA register and has no
+    // alternate path. Mark those nodes so both phases skip them.
+    static bool mapProbeOp[IR_MAX_NODES];
+    memset(mapProbeOp, 0, sizeof(bool) * buf->count);
+    for (uint16_t _i = 0; _i < buf->count; _i++) {
+        const IRNode* _n = &buf->nodes[_i];
+        if (_n->op != IR_MAP_GET && _n->op != IR_MAP_PUT) continue;
+        if (_n->op2 < buf->count) mapProbeOp[_n->op2] = true;
+        if (_n->op == IR_MAP_PUT && _n->imm.map.value < buf->count)
+            mapProbeOp[_n->imm.map.value] = true;
+    }
+
     // --- Phase 1: adjacent-pair cancellation ---
     for (uint16_t i = 0; i < buf->count; i++) {
         IRNode* n = &buf->nodes[i];
+        if (mapProbeOp[i]) continue;
 
         if (n->op == IR_BOX_NUM && n->op1 != IR_NONE) {
             IRNode* src = &buf->nodes[n->op1];
@@ -284,6 +321,7 @@ void irOptBoxUnboxElim(IRBuffer* buf)
     for (uint16_t i = 0; i < buf->count; i++) {
         IRNode* n = &buf->nodes[i];
         if (n->op != IR_BOX_NUM || n->op1 == IR_NONE) continue;
+        if (mapProbeOp[i]) continue;
         if (useCounts[i] == 0) continue;
         if (bitTest(inSnapshot, i)) continue;        // escapes via snapshot
         if (useCounts[i] != unboxUseCounts[i]) continue; // non-UNBOX_NUM user
@@ -383,6 +421,12 @@ void irOptRedundantGuardElim(IRBuffer* buf)
                 } else {
                     bitSet(guardedNotNull, val);
                 }
+                break;
+
+            case IR_GUARD_NUM_OR_NULL:
+                // This admits null and therefore proves neither GUARD_NUM nor
+                // GUARD_NOT_NULL. Keep it unless a dedicated lattice fact is
+                // added for the union type.
                 break;
 
             case IR_GUARD_CLASS:
@@ -586,10 +630,15 @@ void irOptConstPropFold(IRBuffer* buf)
             }
         }
 
-        // GUARD_TRUE(CONST_BOOL(1)) => dead (always passes).
+        // GUARD_TRUE(CONST_BOOL(1)) => dead (always passes). BOX_BOOL of a
+        // constant is equally provable; nested for-loop recording commonly
+        // leaves the boxed form behind after branch lowering.
         if (n->op == IR_GUARD_TRUE && n->op1 != IR_NONE) {
             IRNode* a = &buf->nodes[n->op1];
-            if (a->op == IR_CONST_BOOL && a->imm.intval != 0) {
+            IRNode* c = a;
+            if (a->op == IR_BOX_BOOL && a->op1 < buf->count)
+                c = &buf->nodes[a->op1];
+            if (c->op == IR_CONST_BOOL && c->imm.intval != 0) {
                 killNode(n);
                 continue;
             }
@@ -598,7 +647,10 @@ void irOptConstPropFold(IRBuffer* buf)
         // GUARD_FALSE(CONST_BOOL(0)) => dead (always passes).
         if (n->op == IR_GUARD_FALSE && n->op1 != IR_NONE) {
             IRNode* a = &buf->nodes[n->op1];
-            if (a->op == IR_CONST_BOOL && a->imm.intval == 0) {
+            IRNode* c = a;
+            if (a->op == IR_BOX_BOOL && a->op1 < buf->count)
+                c = &buf->nodes[a->op1];
+            if (c->op == IR_CONST_BOOL && c->imm.intval == 0) {
                 killNode(n);
                 continue;
             }
@@ -662,7 +714,7 @@ void irOptGVN(IRBuffer* buf)
         // GVN; the later alias-aware forwarding pass handles LOAD_FIELD when
         // it can prove which store supplies the value.
         if (n->op == IR_LOAD_STACK || n->op == IR_LOAD_FIELD ||
-            n->op == IR_LOAD_MODULE_VAR)
+            n->op == IR_LOAD_MODULE_VAR || n->op == IR_MAP_GET)
             continue;
         // Do not deduplicate PHI or loop-control nodes.
         if (n->op == IR_PHI || n->op == IR_LOOP_HEADER ||
@@ -759,6 +811,9 @@ void irOptLICM(IRBuffer* buf)
             // field load changes its SSA id and can invalidate the register
             // lifetime expected by field consumers after LICM compaction.
             if (n->op == IR_LOAD_FIELD) continue;
+            // Map state is mutable and its probe loop is an in-node control
+            // flow; never hoist a map access out of the loop.
+            if (n->op == IR_MAP_GET) continue;
             if (n->op == IR_LIST_LOAD) {
                 // The list object is identified by how its SSA value is
                 // produced: a module variable, a stack slot, or a field.  Two
@@ -804,7 +859,8 @@ void irOptLICM(IRBuffer* buf)
             // the GUARD_CLASS proving it is a Range. Guards carry side effects
             // and so never hoist, and hoisting the load past one would
             // dereference whatever the slot happens to hold.
-            if (n->op == IR_LOAD_RANGE || n->op == IR_LIST_COUNT) continue;
+            if (n->op == IR_LOAD_RANGE || n->op == IR_LIST_COUNT ||
+                n->op == IR_LIST_ITERATE) continue;
 
             bool invariant = true;
 
@@ -849,7 +905,7 @@ void irOptLICM(IRBuffer* buf)
                 buf->nodes[j]    = *n;
                 buf->nodes[j].id = j;
                 buf->nodes[j].flags |= IR_FLAG_HOISTED;
-                replaceUses(buf, i, j);
+                replaceUsesAndImm(buf, i, j);
                 killNode(n);
                 break;
             }
@@ -1298,6 +1354,7 @@ void irOptDCE(IRBuffer* buf)
             }
             case IR_STORE_FIELD:
             case IR_LIST_STORE:
+            case IR_MAP_PUT:
             case IR_STORE_MODULE_VAR:
             case IR_SIDE_EXIT:
             case IR_LOOP_BACK:
@@ -1317,6 +1374,23 @@ void irOptDCE(IRBuffer* buf)
         if (isRoot && !bitTest(live, i)) {
             bitSet(live, i);
             worklist[wlCount++] = i;
+        }
+    }
+
+    // Map probe operands are unconditional roots: the generated hash probe
+    // reads the key/value from their SSA registers, so they must never be
+    // swept even when a guard or box that also referenced them was removed.
+    for (uint16_t i = 0; i < buf->count; i++) {
+        IRNode* n = &buf->nodes[i];
+        if (n->op != IR_MAP_GET && n->op != IR_MAP_PUT) continue;
+        uint16_t ops[3] = { n->op1, n->op2,
+                            n->op == IR_MAP_PUT ? n->imm.map.value : IR_NONE };
+        for (int k = 0; k < 3; k++) {
+            uint16_t ref = ops[k];
+            if (ref != IR_NONE && ref < buf->count && !bitTest(live, ref)) {
+                bitSet(live, ref);
+                worklist[wlCount++] = ref;
+            }
         }
     }
 
@@ -1344,7 +1418,10 @@ void irOptDCE(IRBuffer* buf)
         IRNode* n = &buf->nodes[id];
 
         uint16_t ops[3] = { n->op1, n->op2,
-                            n->op == IR_LIST_STORE ? n->imm.list.value : IR_NONE };
+                            n->op == IR_LIST_STORE ? n->imm.list.value :
+                            (n->op == IR_MAP_PUT ? n->imm.map.value :
+                             (n->op == IR_SELECT_NULL ? n->imm.select.value :
+                              IR_NONE)) };
         for (int k = 0; k < 3; k++) {
             uint16_t op = ops[k];
             if (op != IR_NONE && op < buf->count && !bitTest(live, op)) {
@@ -1437,6 +1514,50 @@ void irOptPromoteLoopVars(IRBuffer* buf)
             if (promoted_ptrs[pp] == var_ptr) { already_promoted = true; break; }
         }
         if (already_promoted) continue;
+
+        // A map probe consumes this variable's boxed value as a key or value.
+        // The probe needs the live loop-carried boxed value, and the boxed-PHI
+        // node the promotion builds for it is killed by later passes, leaving
+        // the probe reading garbage. Keep the module var reads/stores intact
+        // instead (the loop-carried store keeps the slot fresh every iteration).
+        // The probe's operand may be the variable's boxed value directly, or a
+        // freshly boxed intermediate whose value derives from this variable, so
+        // chase through box/unbox and arithmetic ops.
+        bool mapConsumer = false;
+        for (uint16_t m = header + 1; m < back && !mapConsumer; m++) {
+            const IRNode* mn = &buf->nodes[m];
+            if (mn->flags & IR_FLAG_DEAD) continue;
+            if (mn->op != IR_MAP_GET && mn->op != IR_MAP_PUT) continue;
+            uint16_t probeOperands[2] = { mn->op2, IR_NONE };
+            if (mn->op == IR_MAP_PUT)
+                probeOperands[1] = mn->imm.map.value;
+            for (int po = 0; po < 2 && !mapConsumer; po++) {
+                uint16_t ssa = probeOperands[po];
+                for (int hop = 0; hop < 10 && ssa < buf->count; hop++) {
+                    const IRNode* sn = &buf->nodes[ssa];
+                    if (sn->flags & IR_FLAG_DEAD) break;
+                    if (sn->op == IR_LOAD_MODULE_VAR) {
+                        if (sn->imm.ptr == var_ptr) mapConsumer = true;
+                        break;
+                    }
+                    if (sn->op == IR_BOX_NUM || sn->op == IR_UNBOX_NUM ||
+                        sn->op == IR_PHI) {
+                        ssa = sn->op1;
+                        continue;
+                    }
+                    if (sn->op == IR_ADD || sn->op == IR_SUB ||
+                        sn->op == IR_MUL || sn->op == IR_DIV ||
+                        sn->op == IR_MOD) {
+                        ssa = sn->op1;   // follow the first (left) operand
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+        if (mapConsumer) {
+            continue;
+        }
 
         // Find a single UNBOX_NUM that directly consumes this LOAD.
         // The recorder emits irEmitUnbox(load_ssa) which is UNBOX_NUM(load_id).
@@ -1584,24 +1705,47 @@ void irOptPromoteLoopVars(IRBuffer* buf)
             if (kn->flags & IR_FLAG_DEAD) continue;
 
             if (kn->op == IR_LOAD_MODULE_VAR && kn->imm.ptr == var_ptr) {
-                replaceUses(buf, k, j0);
-                // A LIST_STORE's recorded value may reference this load. That
-                // stored boxed value must track the loop-carried PHI (j2), not
-                // the loop-entry value (j0), so repurpose this node in place
-                // as BOX_NUM(j2) and keep it live instead of killing it.
-                bool listStoreValue = false;
-                for (uint16_t m = header + 1; m < back && !listStoreValue; m++) {
+                // A boxed value consumer must track the loop-carried PHI (j2),
+                // not the loop-entry value (j0): the list/store and map probe
+                // keys and map values are written and re-read each iteration.
+                // replaceUses below rewrites op1/op2 uses of `k` to j0, but
+                // leaves imm.list.value / imm.map.value pointing at `k`, so we
+                // record the map key consumers first and point them back at
+                // the repurposed BOX_NUM(j2) afterwards.
+                bool boxedConsumer = false;
+                uint16_t mapKeyConsumers[8];
+                int nMapKey = 0;
+                for (uint16_t m = header + 1; m < back; m++) {
                     const IRNode* mn = &buf->nodes[m];
-                    if (!(mn->flags & IR_FLAG_DEAD) && mn->op == IR_LIST_STORE &&
-                        mn->imm.list.value == k) listStoreValue = true;
+                    if (mn->flags & IR_FLAG_DEAD) continue;
+                    if (mn->op == IR_LIST_STORE && mn->imm.list.value == k) {
+                        boxedConsumer = true;
+                    } else if (mn->op == IR_MAP_PUT &&
+                               mn->imm.map.value == k) {
+                        boxedConsumer = true;
+                    }
+                    if ((mn->op == IR_MAP_GET || mn->op == IR_MAP_PUT) &&
+                        mn->op2 == k && nMapKey < 8) {
+                        mapKeyConsumers[nMapKey++] = m;
+                        boxedConsumer = true;
+                    }
                 }
-                if (listStoreValue) {
+                replaceUses(buf, k, j0);
+                if (boxedConsumer) {
+                    // A LIST_STORE's recorded value may reference this load. That
+                    // stored boxed value must track the loop-carried PHI (j2), not
+                    // the loop-entry value (j0), so repurpose this node in place
+                    // as BOX_NUM(j2) and keep it live instead of killing it.
                     kn->op    = IR_BOX_NUM;
                     kn->op1   = j2;
                     kn->op2   = IR_NONE;
                     kn->type  = IR_TYPE_VALUE;
                     kn->flags = 0;
                     memset(&kn->imm, 0, sizeof(kn->imm));
+                    // The map probe's key operand was rewritten to j0 by
+                    // replaceUses; point it back at the boxed PHI node.
+                    for (int mc = 0; mc < nMapKey; mc++)
+                        buf->nodes[mapKeyConsumers[mc]].op2 = k;
                 } else {
                     killNode(kn);
                 }
@@ -1617,6 +1761,32 @@ void irOptPromoteLoopVars(IRBuffer* buf)
                 replaceUses(buf, k, j2);
                 killNode(kn);
             }
+        }
+
+        // Third sub-pass: any other in-loop LOAD_MODULE_VAR of this variable
+        // (the recorder emits one per use site) still reads the module slot,
+        // which the sunk loop-carried store never updates.  Its consumers want
+        // the loop-carried value too: repoint them at the boxed PHI node (k),
+        // including map keys/values and list store values that live in imm
+        // fields rather than op1/op2.  UNBOX(box(j2)) collapses to j2 via the
+        // box/unbox elimination pass, so boxed and unboxed consumers alike are
+        // served correctly.
+        for (uint16_t k = header + 1; k < back; k++) {
+            IRNode* kn = &buf->nodes[k];
+            if (kn->flags & IR_FLAG_DEAD) continue;
+            if (kn->op != IR_LOAD_MODULE_VAR || kn->imm.ptr != var_ptr) continue;
+            if (kn->id == j0 || kn->id == k) continue;
+            uint16_t otherId = kn->id;
+            replaceUses(buf, otherId, k);
+            for (uint16_t m = header + 1; m < back; m++) {
+                IRNode* mn = &buf->nodes[m];
+                if (mn->flags & IR_FLAG_DEAD) continue;
+                if (mn->op == IR_LIST_STORE && mn->imm.list.value == otherId)
+                    mn->imm.list.value = k;
+                if (mn->op == IR_MAP_PUT && mn->imm.map.value == otherId)
+                    mn->imm.map.value = k;
+            }
+            killNode(kn);
         }
     }
 
@@ -2023,7 +2193,21 @@ void irOptPromoteNumericStackPhis(IRBuffer* buf)
         oldPhi->type = IR_TYPE_VOID;
         oldPhi->flags = IR_FLAG_GUARD | IR_FLAG_HOISTED;
         oldPhi->imm.snapshot_id = preSnapId;
-        killNode(&buf->nodes[boxedId]);
+        // The boxed back-edge value may feed the inline map probe as a key or
+        // stored value. The probe reads its SSA register directly, so it must
+        // stay live; the numeric-iterator rewrites below only concern
+        // truthiness tests and numeric unboxes.
+        bool boxedIsMapOperand = false;
+        for (uint16_t j = (uint16_t)(header + 1); j < buf->count && !boxedIsMapOperand; j++) {
+            const IRNode* user = &buf->nodes[j];
+            if (user->flags & IR_FLAG_DEAD) continue;
+            if ((user->op == IR_MAP_GET || user->op == IR_MAP_PUT) &&
+                user->op2 == boxedId) boxedIsMapOperand = true;
+            if (user->op == IR_MAP_PUT && user->imm.map.value == boxedId)
+                boxedIsMapOperand = true;
+        }
+        if (!boxedIsMapOperand)
+            killNode(&buf->nodes[boxedId]);
 
         for (uint16_t j = (uint16_t)(header + 1); j < buf->count; j++) {
             IRNode* n = &buf->nodes[j];
@@ -3444,9 +3628,35 @@ void irOptRelocatePostBackConstants(IRBuffer* buf)
             buf->nodes[j] = *n;
             buf->nodes[j].id = j;
             buf->nodes[j].flags |= IR_FLAG_INVARIANT | IR_FLAG_HOISTED;
-            replaceUses(buf, i, j);
+            replaceUsesAndImm(buf, i, j);
             killNode(n);
             break;
+        }
+    }
+}
+
+// A get followed by a put to the identical map/key can reuse the entry address
+// found by the getter. Any intervening map access or call invalidates the
+// code generator's cached probe or may resize the table.
+static void irOptFuseMapGetPut(IRBuffer* buf)
+{
+    for (uint16_t p = 0; p < buf->count; p++) {
+        IRNode* put = &buf->nodes[p];
+        if ((put->flags & IR_FLAG_DEAD) || put->op != IR_MAP_PUT) continue;
+        for (uint16_t g = p; g-- > 0;) {
+            IRNode* get = &buf->nodes[g];
+            if (get->flags & IR_FLAG_DEAD) continue;
+            if (get->op == IR_MAP_GET) {
+                if (get->op1 == put->op1 && get->op2 == put->op2) {
+                    get->flags |= IR_FLAG_MAP_PROBE_GET;
+                    put->flags |= IR_FLAG_MAP_REUSE_PUT;
+                    put->imm.map.probe = g;
+                }
+                break;
+            }
+            if (get->op == IR_MAP_PUT || get->op == IR_CALL_C ||
+                get->op == IR_CALL_WREN)
+                break;
         }
     }
 }
@@ -3529,6 +3739,8 @@ void irOptimize(IRBuffer* buf)
     if (getenv("WREN_JIT_NO_DENOM") == NULL)
         irOptDenomRecurrence(buf); // 18. Fast-forward the denom recurrence
     debugSnap0("denom", buf);
+    irOptFuseMapGetPut(buf);       // 18b. Reuse identical map/key probe
+    debugSnap0("mapfuse", buf);
     irOptRelocatePostBackConstants(buf); // 19. Move post-back constants pre-loop
     debugSnap0("relocate", buf);
 }

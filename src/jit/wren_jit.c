@@ -46,6 +46,35 @@ bool wrenJitDebugEnabled(void)
     return cached != 0;
 }
 
+// The other diagnostic gates run on the trace-entry/trace-exit hot path
+// (millions of times per benchmark), so they get the same memoized treatment.
+// Each flag needs its own static: a shared slot would reset whenever a second
+// flag is looked up, re-entering getenv on every exit.
+static bool memoizedEnvFlag(const char* name, int* cached)
+{
+    if (*cached < 0) {
+        const char* value = getenv(name);
+        *cached = (value != NULL && value[0] != '\0' && strcmp(value, "0") != 0);
+    }
+    return *cached != 0;
+}
+
+static bool dbgEntryEnabled(void)
+{
+    static int cached = -1;
+    return memoizedEnvFlag("WREN_JIT_DBG_ENTRY", &cached);
+}
+static bool dbgBCEnabled(void)
+{
+    static int cached = -1;
+    return memoizedEnvFlag("WREN_JIT_DBG_BC", &cached);
+}
+static bool traceExitsEnabled(void)
+{
+    static int cached = -1;
+    return memoizedEnvFlag("WREN_JIT_TRACE_EXITS", &cached);
+}
+
 #define JIT_DEBUG_LOG(...)                           \
     do {                                            \
         if (wrenJitDebugEnabled()) {                \
@@ -118,6 +147,7 @@ void wrenJitFree(WrenVM* vm, WrenJitState* jit)
             }
             free(t->snapshots);
             free(t->gc_roots);
+            free(t->nested_exit_cache);
         }
         free(jit->traces);
     }
@@ -188,7 +218,7 @@ int wrenJitExecute(WrenVM* vm, JitTrace* trace)
     Value* modVarsData = traceFn->module->variables.data;
 
     JitTraceFunc fn = (JitTraceFunc)trace->code;
-    if (getenv("WREN_JIT_DBG_ENTRY") && trace->exec_count <= 24) {
+    if (dbgEntryEnabled() && trace->exec_count <= 24) {
         Value* ss = frame->stackStart;
         fprintf(stderr, "[ENTRY] exec=%u anchor=%p anchoridx=%ld ip=%p depth=%ld code=%u stack[",
                 trace->exec_count, (void*)trace->anchor_pc,
@@ -203,7 +233,7 @@ int wrenJitExecute(WrenVM* vm, JitTrace* trace)
                     dv, (void*)(uintptr_t)ss[si]);
         }
         fprintf(stderr, "]\n");
-        if (getenv("WREN_JIT_DBG_BC")) {
+        if (dbgBCEnabled()) {
             int idx = (int)(trace->anchor_pc - traceFn->code.data);
             fprintf(stderr, "  anchor opcode=%d at index %d bytes:",
                     (int)trace->anchor_pc[0], idx);
@@ -243,7 +273,7 @@ int wrenJitExecute(WrenVM* vm, JitTrace* trace)
                     traceFn->debug->name ? traceFn->debug->name : "?",
                     (int)(trace->anchor_pc - traceFn->code.data),
                     (int)(rpc - traceFn->code.data));
-            if (getenv("WREN_JIT_DBG_BC") && rpc != NULL) {
+            if (dbgBCEnabled() && rpc != NULL) {
                 int idx = (int)(rpc - traceFn->code.data);
                 int start = idx - 8; if (start < 0) start = 0;
                 int k = start;
@@ -281,10 +311,27 @@ int wrenJitExecute(WrenVM* vm, JitTrace* trace)
                 trace->loop_handoff_exits < JIT_RE_RECORD_HANDOFF_EXITS &&
                 vm->jit != NULL &&
                 vm->jit->re_records_done < JIT_MAX_RE_RECORDS) {
-                if (exit_resumes_in_nested_loop(snap->resume_pc,
-                                                trace->anchor_pc,
-                                                traceFn->code.data,
-                                                traceFn->code.count)) {
+                // The scan is per-(resume_pc, anchor_pc), which is immutable for
+                // a function, so memoize the result per snapshot: a healthy
+                // trace with a hot exit (fannkuch's swap loop) would otherwise
+                // re-scan up to a kilobyte of bytecode on every single exit.
+                uint8_t cached = trace->nested_exit_cache
+                    ? trace->nested_exit_cache[exitIdx] : 0;
+                bool inNested;
+                if (cached == 1) {
+                    inNested = true;
+                } else if (cached == 2) {
+                    inNested = false;
+                } else {
+                    inNested = exit_resumes_in_nested_loop(snap->resume_pc,
+                                                           trace->anchor_pc,
+                                                           traceFn->code.data,
+                                                           traceFn->code.count);
+                    if (trace->nested_exit_cache)
+                        trace->nested_exit_cache[exitIdx] =
+                            inNested ? 1 : 2;
+                }
+                if (inNested) {
                     trace->loop_handoff_exits++;
                     if (trace->loop_handoff_exits ==
                             JIT_RE_RECORD_HANDOFF_EXITS &&
@@ -309,7 +356,7 @@ int wrenJitExecute(WrenVM* vm, JitTrace* trace)
                 }
             }
         }
-        if (getenv("WREN_JIT_TRACE_EXITS")) {
+        if (traceExitsEnabled() && trace->exit_count <= 40) {
             extern const char* const wrenOpNames[];
             uint8_t* base = frame->closure->fn->code.data;
             long off = (long)(frame->ip - base);
@@ -455,6 +502,7 @@ void wrenJitStoreTrace(WrenJitState* jit, JitTrace* trace)
             }
             free(jit->traces[idx].snapshots);
             free(jit->traces[idx].gc_roots);
+            free(jit->traces[idx].nested_exit_cache);
             jit->traces[idx] = *trace;
             return;
         }
@@ -564,6 +612,7 @@ JitTrace* wrenJitCompileAndStore(WrenVM* vm, WrenJitState* jit,
     if (getenv("WREN_JIT_DUMP_BC") && fiber && fiber->numFrames > 0) {
         CallFrame* f0 = &fiber->frames[fiber->numFrames - 1];
         if (f0->closure && f0->closure->fn) wrenDumpCode(vm, f0->closure->fn);
+        fflush(stdout);
     }
 
     // Code generation.  (ir is part of the recorder struct, not heap-allocated.)

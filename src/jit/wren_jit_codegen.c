@@ -36,6 +36,15 @@
                                      offsetof(ValueBuffer, data)))
 #define LIST_COUNT_OFFSET ((sljit_sw)(offsetof(ObjList, elements) + \
                                       offsetof(ValueBuffer, count)))
+// ObjMap open-addressing layout: capacity (uint32), count (uint32), entries
+// (MapEntry*, 16 bytes each: key at +0, value at +8).
+#define MAP_CAPACITY_OFFSET ((sljit_sw)offsetof(ObjMap, capacity))
+#define MAP_COUNT_OFFSET    ((sljit_sw)offsetof(ObjMap, count))
+#define MAP_ENTRIES_OFFSET  ((sljit_sw)offsetof(ObjMap, entries))
+#define MAP_ENTRY_KEY_OFFSET   0
+#define MAP_ENTRY_VALUE_OFFSET 8
+#define MAP_UNDEFINED_VAL ((sljit_uw)(WREN_QNAN | 4ULL))  // TAG_UNDEFINED
+#define MAP_FALSE_VAL     ((sljit_uw)(WREN_QNAN | 2ULL))  // TAG_FALSE
 // Sunk module stores write the loop-carried PHI back only after the loop body
 // has executed at least once. The generated code tracks that with a flag in
 // WrenJitState: reset by the trace prologue, set by LOOP_BACK, tested by the
@@ -74,8 +83,9 @@
 // ---------------------------------------------------------------------------
 
 // GP scratch pool index 0-5 -> SLJIT_R0..SLJIT_R5.
-// Pool indices 0 and 1 (R0, R1) are reserved in the regalloc as scratch;
-// SSA values are allocated starting from index 2 (R2).
+// Pool indices 0-3 (R0-R3) are reserved in the regalloc as scratch; R0/R1 for
+// guards, box/unbox and loads/stores, R2/R3 for the map probe loop. SSA
+// values are allocated starting from index 4 (R4).
 // FP scratch pool index 100-105 -> SLJIT_FR0..FR5 => SLJIT_FR(i - 100)
 // FP saved pool index 200-203 -> SLJIT_FS0..FS3 => SLJIT_FS(i - 200)
 
@@ -181,7 +191,7 @@ static void getFP(const RegAllocState* ra, uint16_t ssaId,
 
 // Temporary spill area offset (past all regalloc spill slots).
 // We reserve 16 bytes for box/unbox temporaries.
-#define TMP_AREA_SIZE 16
+#define TMP_AREA_SIZE 96
 
 static bool isAscendingIntegralPhi(const IRBuffer* ir, uint16_t id)
 {
@@ -297,10 +307,11 @@ static void materializeForwardConsts(struct sljit_compiler* C,
 }
 
 // Emit back-edge copies (phi = op2) for the loop-carried PHIs of a nested
-// loop, which pass 0 promotes into the anchor body between the previous loop
-// header and the nested header ([start, end)). Only PHIs whose back-edge value
-// is computed inside the loop being closed ([hdr, back_pos)) are copied, which
-// excludes pre-header anchor PHIs (whose op2 lives in the outer body).
+// loop. Only PHIs whose back-edge value is computed inside the loop being
+// closed ([hdr, back_pos)) are copied. Scan the whole prefix: a loop can be
+// opened after another nested loop was recorded, leaving its entry-store PHI
+// before that intervening header (list-for around a matcher is the canonical
+// case). The op2 range is the authoritative ownership test.
 static void emitNestedBackedgeCopies(struct sljit_compiler* C,
                                      const RegAllocState* ra,
                                      const IRBuffer* ir,
@@ -479,6 +490,14 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             exitsPerSnapshot[complete] += 1;
             continue;
         }
+        if (n->op == IR_LIST_ITERATE) {
+            uint16_t sid = n->imm.list.snapshot;
+            if (sid >= IR_MAX_SNAPSHOTS ||
+                exitsPerSnapshot[sid] + 1 > MAX_EXITS_PER_SNAP)
+                return NULL;
+            exitsPerSnapshot[sid] += 1;
+            continue;
+        }
         if (n->op == IR_LIST_LOAD || n->op == IR_LIST_STORE) {
             uint16_t sid = n->imm.list.snapshot;
             // A bounds-hoisted access (ascending integral PHI, hoisted
@@ -502,12 +521,26 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             exitsPerSnapshot[sid] += 1;
             continue;
         }
+        if (n->op == IR_MAP_PUT) {
+            // The resize guard side-exits to the interpreter, which performs
+            // the real wrenMapSet (resize + insert) and re-records the next
+            // iteration at the new capacity.
+            uint16_t sid = n->imm.map.snapshot;
+            uint16_t mapExits = (n->flags & IR_FLAG_MAP_REUSE_PUT) ? 2 : 1;
+            if (sid >= IR_MAX_SNAPSHOTS ||
+                exitsPerSnapshot[sid] + mapExits > MAX_EXITS_PER_SNAP)
+                return NULL;
+            exitsPerSnapshot[sid] += mapExits;
+            continue;
+        }
         uint16_t sid = IR_NONE;
         uint16_t needed = 0;
         if (n->op == IR_GUARD_CLASS) {
             sid = n->op2;
             needed = 1;
-        } else if (n->op == IR_GUARD_NUM || n->op == IR_GUARD_BOOL ||
+        } else if (n->op == IR_GUARD_NUM ||
+                   n->op == IR_GUARD_NUM_OR_NULL ||
+                   n->op == IR_GUARD_BOOL ||
                    n->op == IR_GUARD_TRUE || n->op == IR_GUARD_FALSE ||
                    n->op == IR_GUARD_NOT_NULL || n->op == IR_SIDE_EXIT) {
             sid = n->imm.snapshot_id;
@@ -536,6 +569,7 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
 
     struct sljit_compiler* C = sljit_create_compiler(NULL);
     if (!C) return NULL;
+    if (getenv("WREN_JIT_SLJIT_VERBOSE")) sljit_compiler_verbose(C, stderr);
 
     // Compute local frame size: regalloc spill area + temporary area.
     int spillBytes = ra->max_spill_slots * 8;
@@ -1448,6 +1482,58 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
         }
 
         // ----- Comparison (FP or integer -> bool in GP) -----
+        case IR_VAL_EQ:
+        case IR_VAL_NEQ: {
+            // 64-bit compare of two boxed Wren Values -> raw bool. Used for
+            // ==/!= against null/bool, where identity is the whole meaning.
+            int s1r, s1m; sljit_sw s1o;
+            int s2r, s2m; sljit_sw s2o;
+            int dr, dm;   sljit_sw dof;
+            getGP(ra, n->op1, &s1r, &s1m, &s1o);
+            getGP(ra, n->op2, &s2r, &s2m, &s2o);
+            getGP(ra, n->id,  &dr,  &dm,  &dof);
+
+            int a = s1r, b = s2r;
+            if (s1m) { sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, s1r, s1o); a = SLJIT_R0; }
+            if (s2m) { sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, s2r, s2o); b = SLJIT_R1; }
+
+            sljit_s32 condition = (n->op == IR_VAL_EQ) ? SLJIT_EQUAL
+                                                       : SLJIT_NOT_EQUAL;
+            struct sljit_jump* isTrue =
+                sljit_emit_cmp(C, condition, a, 0, b, 0);
+            int out = dm ? SLJIT_R0 : dr;
+            sljit_emit_op1(C, SLJIT_MOV, out, 0, SLJIT_IMM, 0);
+            struct sljit_jump* done = sljit_emit_jump(C, SLJIT_JUMP);
+            struct sljit_label* trueLabel = sljit_emit_label(C);
+            sljit_set_label(isTrue, trueLabel);
+            sljit_emit_op1(C, SLJIT_MOV, out, 0, SLJIT_IMM, 1);
+            struct sljit_label* doneLabel = sljit_emit_label(C);
+            sljit_set_label(done, doneLabel);
+            if (dm) sljit_emit_op1(C, SLJIT_MOV, dr, dof, out, 0);
+            break;
+        }
+
+        case IR_SELECT_NULL: {
+            int tr, tm; sljit_sw to;
+            int nr, nm; sljit_sw no;
+            int vr, vm; sljit_sw vo;
+            int dr, dm; sljit_sw dof;
+            getGP(ra, n->op1, &tr, &tm, &to);
+            getGP(ra, n->op2, &nr, &nm, &no);
+            getGP(ra, n->imm.select.value, &vr, &vm, &vo);
+            getGP(ra, n->id, &dr, &dm, &dof);
+
+            int out = dm ? SLJIT_R0 : dr;
+            sljit_emit_op1(C, SLJIT_MOV, out, 0, vr, vm ? vo : 0);
+            sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_Z,
+                            tr, tm ? to : 0,
+                            SLJIT_IMM, (sljit_sw)WREN_NULL_VAL);
+            sljit_emit_select(C, SLJIT_EQUAL, out, nr, nm ? no : 0, out);
+            if (dm)
+                sljit_emit_op1(C, SLJIT_MOV, dr, dof, out, 0);
+            break;
+        }
+
         case IR_LT:
         case IR_GT:
         case IR_LTE:
@@ -1651,6 +1737,38 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                 exitJumpCount[snapId] < MAX_EXITS_PER_SNAP) {
                 exitJumpArr[snapId][exitJumpCount[snapId]++] = jmp;
             }
+            break;
+        }
+
+        case IR_GUARD_NUM_OR_NULL: {
+            // Materialize `tagged && value != null` without branching on the
+            // common number/null distinction. The sole branch is the cold
+            // side exit for every other Wren type.
+            uint16_t valId = n->op1;
+            uint16_t snapId = n->imm.snapshot_id;
+            if (valId == IR_NONE) break;
+            int srcReg, srcMem; sljit_sw srcOff;
+            getGP(ra, valId, &srcReg, &srcMem, &srcOff);
+            int src = srcMem ? SLJIT_R0 : srcReg;
+            if (srcMem)
+                sljit_emit_op1(C, SLJIT_MOV, src, 0, srcReg, srcOff);
+
+            sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_Z, src, 0,
+                            SLJIT_IMM, (sljit_sw)WREN_NULL_VAL);
+            sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R1, 0,
+                                SLJIT_NOT_EQUAL);
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0, src, 0,
+                           SLJIT_IMM, (sljit_sw)WREN_QNAN);
+            sljit_emit_op2u(C, SLJIT_SUB | SLJIT_SET_Z, SLJIT_R0, 0,
+                            CONST_QNAN_REG, 0);
+            sljit_emit_op_flags(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_EQUAL);
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0,
+                           SLJIT_R0, 0, SLJIT_R1, 0);
+            struct sljit_jump* jmp = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+                SLJIT_R0, 0, SLJIT_IMM, 0);
+            if (snapId < (uint16_t)maxSnapshots &&
+                exitJumpCount[snapId] < MAX_EXITS_PER_SNAP)
+                exitJumpArr[snapId][exitJumpCount[snapId]++] = jmp;
             break;
         }
 
@@ -2313,17 +2431,9 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                     }
                 }
                 if (nlbl) {
-                    // PHIs for this nested loop sit between the previous loop
-                    // header and this loop's header.
                     uint16_t hdr = n->op1;
-                    uint16_t prev_header = ir->loop_header;
-                    for (uint16_t p = 0; p < hdr && p < ir->count; p++) {
-                        if (ir->nodes[p].op == IR_LOOP_HEADER)
-                            prev_header = p;
-                    }
                     emitNestedBackedgeCopies(C, ra, ir, backedgeToPhi,
-                                             (uint16_t)(prev_header + 1),
-                                             hdr, hdr, i);
+                                             0, hdr, hdr, i);
                     struct sljit_jump* backJump = sljit_emit_jump(C, SLJIT_JUMP);
                     sljit_set_label(backJump, nlbl);
                 }
@@ -2781,6 +2891,87 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
             break;
         }
 
+        case IR_LIST_ITERATE: {
+            // Exact List.iterate(_) protocol for its normal null/number
+            // states. Returning false in-trace lets the enclosing for-loop
+            // terminate as a native nested branch instead of side-exiting.
+            int listReg, listMem; sljit_sw listOff;
+            int iterReg, iterMem; sljit_sw iterOff;
+            int dstReg, dstMem; sljit_sw dstOff;
+            getGP(ra, n->op1, &listReg, &listMem, &listOff);
+            getGP(ra, n->op2, &iterReg, &iterMem, &iterOff);
+            getGP(ra, n->id, &dstReg, &dstMem, &dstOff);
+
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           iterReg, iterMem ? iterOff : 0);
+            struct sljit_jump* start = sljit_emit_cmp(
+                C, SLJIT_EQUAL, SLJIT_R0, 0,
+                SLJIT_IMM, (sljit_sw)WREN_NULL_VAL);
+
+            // Numeric continuation: validateInt(), then advance. Integral
+            // negative/out-of-range values mean completion in Wren.
+            sljit_emit_fcopy(C, SLJIT_COPY_TO_F64, SLJIT_FR0, SLJIT_R0);
+            sljit_emit_fop1(C, SLJIT_CONV_SW_FROM_F64,
+                            SLJIT_R1, 0, SLJIT_FR0, 0);
+            sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW,
+                            SLJIT_FR1, 0, SLJIT_R1, 0);
+            struct sljit_jump* nonIntegral = sljit_emit_fcmp(
+                C, SLJIT_UNORDERED_OR_NOT_EQUAL,
+                SLJIT_FR0, 0, SLJIT_FR1, 0);
+            uint16_t sid = n->imm.list.snapshot;
+            if (sid < (uint16_t)maxSnapshots &&
+                exitJumpCount[sid] < MAX_EXITS_PER_SNAP)
+                exitJumpArr[sid][exitJumpCount[sid]++] = nonIntegral;
+            struct sljit_jump* negative = sljit_emit_cmp(
+                C, SLJIT_SIG_LESS, SLJIT_R1, 0, SLJIT_IMM, 0);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R1, 0,
+                           SLJIT_R1, 0, SLJIT_IMM, 1);
+
+            // R2 = untagged ObjList*, R3 = element count.
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                           listReg, listMem ? listOff : 0);
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R2, 0, SLJIT_R2, 0,
+                           SLJIT_IMM,
+                           (sljit_sw)~(WREN_SIGN_BIT | WREN_QNAN));
+            sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R3, 0,
+                           SLJIT_MEM1(SLJIT_R2), LIST_COUNT_OFFSET);
+            struct sljit_jump* complete = sljit_emit_cmp(
+                C, SLJIT_SIG_GREATER_EQUAL,
+                SLJIT_R1, 0, SLJIT_R3, 0);
+
+            sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW,
+                            SLJIT_FR0, 0, SLJIT_R1, 0);
+            sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, SLJIT_FR0, SLJIT_R0);
+            struct sljit_jump* doneNumeric = sljit_emit_jump(C, SLJIT_JUMP);
+
+            // Null start: numeric zero for a non-empty list.
+            sljit_set_label(start, sljit_emit_label(C));
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                           listReg, listMem ? listOff : 0);
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R2, 0, SLJIT_R2, 0,
+                           SLJIT_IMM,
+                           (sljit_sw)~(WREN_SIGN_BIT | WREN_QNAN));
+            sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R3, 0,
+                           SLJIT_MEM1(SLJIT_R2), LIST_COUNT_OFFSET);
+            struct sljit_jump* empty = sljit_emit_cmp(
+                C, SLJIT_EQUAL, SLJIT_R3, 0, SLJIT_IMM, 0);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_IMM, 0);
+            struct sljit_jump* doneStart = sljit_emit_jump(C, SLJIT_JUMP);
+
+            struct sljit_label* falseLabel = sljit_emit_label(C);
+            sljit_set_label(negative, falseLabel);
+            sljit_set_label(complete, falseLabel);
+            sljit_set_label(empty, falseLabel);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           SLJIT_IMM, (sljit_sw)WREN_FALSE_VAL);
+            struct sljit_label* done = sljit_emit_label(C);
+            sljit_set_label(doneNumeric, done);
+            sljit_set_label(doneStart, done);
+            sljit_emit_op1(C, SLJIT_MOV, dstReg, dstMem ? dstOff : 0,
+                           SLJIT_R0, 0);
+            break;
+        }
+
         case IR_LIST_LOAD:
         case IR_LIST_STORE: {
             // The class and numeric guards precede this node. Validate that
@@ -2901,6 +3092,413 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
                                    SLJIT_MEM2(dataBase, SLJIT_R0),
                                    SLJIT_WORD_SHIFT);
                 }
+            }
+            break;
+        }
+
+        // ----- Map hash-table access (inline linear probe) -----
+        case IR_MAP_GET:
+        case IR_MAP_PUT: {
+            // op1 = boxed map Value, op2 = boxed key Value. Wren's ObjMap is
+            // open addressing with linear probing: index = hashValue(key) %
+            // capacity (capacity is a power of two, so & (cap-1)), entries are
+            // 16-byte MapEntry{key, value}. A slot whose key is UNDEFINED_VAL
+            // is free (value FALSE_VAL = empty, TRUE_VAL = tombstone; the
+            // probe continues past tombstones). The getter returns null on a
+            // miss; the setter grows the table when count+1 > capacity*75/100
+            // and side-exits so the real wrenMapSet runs the resize.
+            //
+            // Register-resident probe: R0 = idx (byte offset, loop-carried),
+            // R1 = entries base, R2 = entry addr / scratch, R3 = key. Only
+            // register operands are used so the backend's well-tested paths
+            // apply. The wrap mask lives in the temp area.
+            bool isPut = (n->op == IR_MAP_PUT);
+            uint16_t snapId = isPut ? n->imm.map.snapshot : IR_NONE;
+
+            // The paired getter already hashed/probed and cached the resolved
+            // entry address at tmp+40. Reuse it for overwrite/insert.
+            if (isPut && (n->flags & IR_FLAG_MAP_REUSE_PUT)) {
+                uint16_t valId = n->imm.map.value;
+                if (valId < ir->count && ir->nodes[valId].type == IR_TYPE_VALUE) {
+                    int vr, vm; sljit_sw vo;
+                    getGP(ra, valId, &vr, &vm, &vo);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, vr, vm ? vo : 0);
+                } else if (valId < ir->count &&
+                           ir->nodes[valId].type == IR_TYPE_NUM) {
+                    int vr, vm; sljit_sw vo;
+                    getFP(ra, valId, &vr, &vm, &vo);
+                    int vf = vr;
+                    if (vm) {
+                        sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR0, 0, vr, vo);
+                        vf = SLJIT_FR0;
+                    }
+                    sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, vf, SLJIT_R1);
+                } else {
+                    int vr, vm; sljit_sw vo;
+                    getGP(ra, valId, &vr, &vm, &vo);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, vr, vm ? vo : 0);
+                    sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW, SLJIT_FR0, 0,
+                                    SLJIT_R1, 0);
+                    sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, SLJIT_FR0, SLJIT_R1);
+                }
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff + 8,
+                               SLJIT_R1, 0);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                               SLJIT_MEM1(SLJIT_SP), tmpOff + 40);
+                struct sljit_jump* noEntry = sljit_emit_cmp(
+                    C, SLJIT_EQUAL, SLJIT_R2, 0, SLJIT_IMM, 0);
+                if (snapId < (uint16_t)maxSnapshots &&
+                    exitJumpCount[snapId] < MAX_EXITS_PER_SNAP)
+                    exitJumpArr[snapId][exitJumpCount[snapId]++] = noEntry;
+
+                // Match wrenMapSet exactly: its load-factor check runs before
+                // it knows whether this is an overwrite, so it may resize even
+                // for an existing key (which can affect iteration order).
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+                               SLJIT_MEM1(SLJIT_SP), tmpOff + 32);
+                sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_R3), MAP_COUNT_OFFSET);
+                sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R1, 0,
+                               SLJIT_MEM1(SLJIT_R3), MAP_CAPACITY_OFFSET);
+                // Map capacities are powers of two, hence cap * 75 / 100 is
+                // exactly cap * 3 / 4.  `count + 1 > threshold` is therefore
+                // `count >= threshold`; this avoids two hot multiplications.
+                sljit_emit_op2(C, SLJIT_MUL, SLJIT_R1, 0, SLJIT_R1, 0,
+                               SLJIT_IMM, 3);
+                sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R1, 0, SLJIT_R1, 0,
+                               SLJIT_IMM, 2);
+                struct sljit_jump* growReuse = sljit_emit_cmp(
+                    C, SLJIT_SIG_GREATER_EQUAL, SLJIT_R0, 0, SLJIT_R1, 0);
+                if (snapId < (uint16_t)maxSnapshots &&
+                    exitJumpCount[snapId] < MAX_EXITS_PER_SNAP)
+                    exitJumpArr[snapId][exitJumpCount[snapId]++] = growReuse;
+
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_R2), MAP_ENTRY_KEY_OFFSET);
+                struct sljit_jump* missing = sljit_emit_cmp(
+                    C, SLJIT_EQUAL, SLJIT_R0, 0,
+                    SLJIT_IMM, (sljit_sw)MAP_UNDEFINED_VAL);
+
+                // Existing key: overwrite without a resize check.
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_SP), tmpOff + 8);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R2),
+                               MAP_ENTRY_VALUE_OFFSET, SLJIT_R0, 0);
+                struct sljit_jump* reuseDone = sljit_emit_jump(C, SLJIT_JUMP);
+
+                // Missing key: insert into the cached empty/tombstone entry
+                // and increment count (capacity was guarded above).
+                sljit_set_label(missing, sljit_emit_label(C));
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_SP), tmpOff);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R2),
+                               MAP_ENTRY_KEY_OFFSET, SLJIT_R0, 0);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_SP), tmpOff + 8);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R2),
+                               MAP_ENTRY_VALUE_OFFSET, SLJIT_R0, 0);
+                sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_R3), MAP_COUNT_OFFSET);
+                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0,
+                               SLJIT_IMM, 1);
+                sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_MEM1(SLJIT_R3),
+                               MAP_COUNT_OFFSET, SLJIT_R0, 0);
+                sljit_set_label(reuseDone, sljit_emit_label(C));
+                break;
+            }
+
+            // Load the boxed map Value into R1, strip the NaN tag into R2.
+            int mapReg, mapMem; sljit_sw mapOff;
+            getGP(ra, n->op1, &mapReg, &mapMem, &mapOff);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                           mapMem ? SLJIT_MEM1(mapReg) : mapReg,
+                           mapMem ? mapOff : 0);
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R2, 0, SLJIT_R1, 0,
+                           SLJIT_IMM, (sljit_sw)~(WREN_SIGN_BIT | WREN_QNAN));
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff + 32,
+                           SLJIT_R2, 0); // map ptr backup
+
+            // Load the boxed key into R3; back it up for the hash step.
+            int keyReg, keyMem; sljit_sw keyOff;
+            getGP(ra, n->op2, &keyReg, &keyMem, &keyOff);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+                           keyMem ? SLJIT_MEM1(keyReg) : keyReg,
+                           keyMem ? keyOff : 0);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff,
+                           SLJIT_R3, 0);
+
+            struct sljit_jump* emptyMap = NULL;
+            struct sljit_jump* grow = NULL;
+            if (isPut || (n->flags & IR_FLAG_MAP_PROBE_GET)) {
+                // Fused getters also track tombstones for the later insert.
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff + 24,
+                               SLJIT_IMM, 0);
+            }
+            if (isPut) {
+                // Spill the stored value for the insert site. A Wren Num's
+                // NaN-boxed Value bits ARE the double bits, so an unboxed NUM
+                // operand (the optimizer may fold a boxed constant) is boxed
+                // by copying the FP register to a GP register.
+                uint16_t valId = n->imm.map.value;
+                if (valId < ir->count &&
+                    ir->nodes[valId].type == IR_TYPE_VALUE) {
+                    int valReg, valMem; sljit_sw valOff;
+                    getGP(ra, valId, &valReg, &valMem, &valOff);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                                   valMem ? SLJIT_MEM1(valReg) : valReg,
+                                   valMem ? valOff : 0);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff + 8,
+                                   SLJIT_R1, 0);
+                } else if (valId < ir->count &&
+                           ir->nodes[valId].type == IR_TYPE_NUM) {
+                    int valReg, valMem; sljit_sw valOff;
+                    getFP(ra, valId, &valReg, &valMem, &valOff);
+                    int fr = valReg;
+                    if (valMem) {
+                        sljit_emit_fop1(C, SLJIT_MOV_F64, SLJIT_FR0, 0,
+                                        valReg, valOff);
+                        fr = SLJIT_FR0;
+                    }
+                    sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, fr, SLJIT_R1);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff + 8,
+                                   SLJIT_R1, 0);
+                } else {
+                    // Raw integer: box by converting to a double.
+                    int valReg, valMem; sljit_sw valOff;
+                    getGP(ra, valId, &valReg, &valMem, &valOff);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                                   valMem ? SLJIT_MEM1(valReg) : valReg,
+                                   valMem ? valOff : 0);
+                    sljit_emit_fop1(C, SLJIT_CONV_F64_FROM_SW, SLJIT_FR0, 0,
+                                    SLJIT_R1, 0);
+                    sljit_emit_fcopy(C, SLJIT_COPY_FROM_F64, SLJIT_FR0, SLJIT_R1);
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff + 8,
+                                   SLJIT_R1, 0);
+                }
+                // Resize guard: (count + 1) * 100 > capacity * 75 -> exit.
+                sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_R2), MAP_COUNT_OFFSET);
+                sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R1, 0,
+                               SLJIT_MEM1(SLJIT_R2), MAP_CAPACITY_OFFSET);
+                sljit_emit_op2(C, SLJIT_MUL, SLJIT_R1, 0, SLJIT_R1, 0,
+                               SLJIT_IMM, 3);
+                sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R1, 0, SLJIT_R1, 0,
+                               SLJIT_IMM, 2);
+                grow = sljit_emit_cmp(C, SLJIT_SIG_GREATER_EQUAL,
+                                      SLJIT_R0, 0, SLJIT_R1, 0);
+                if (snapId < (uint16_t)maxSnapshots &&
+                    exitJumpCount[snapId] < MAX_EXITS_PER_SNAP)
+                    exitJumpArr[snapId][exitJumpCount[snapId]++] = grow;
+            }
+
+            // ---- Hash the boxed key bits (Thomas Wang, matches hashBits) ----
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                           SLJIT_MEM1(SLJIT_SP), tmpOff);
+            // hash = ~hash + (hash << 18)
+            sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, 18);
+            sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, -1);   // ~hash
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_R1, 0);
+            // hash ^= hash >> 31
+            sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R1, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, 31);
+            sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_R1, 0);
+            // hash *= 21  ==  hash + (hash << 2) + (hash << 4)
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_R0, 0);
+            sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, 2);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_R1, 0);
+            sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0, SLJIT_R1, 0,
+                           SLJIT_IMM, 4);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_R1, 0);
+            // hash ^= hash >> 11
+            sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R1, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, 11);
+            sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_R1, 0);
+            // hash += hash << 6
+            sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, 6);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_R1, 0);
+            // hash ^= hash >> 22
+            sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R1, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, 22);
+            sljit_emit_op2(C, SLJIT_XOR, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_R1, 0);
+            // hash &= 0x3fffffff (hashValue returns 30 bits)
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, (sljit_sw)0x3fffffff);
+
+            // ---- index = hash & (capacity - 1), byte offset * 16 ----
+            sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R1, 0,
+                           SLJIT_MEM1(SLJIT_R2), MAP_CAPACITY_OFFSET);
+            emptyMap = sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R1, 0,
+                                      SLJIT_IMM, 0);
+            sljit_emit_op2(C, SLJIT_SUB, SLJIT_R1, 0, SLJIT_R1, 0,
+                           SLJIT_IMM, 1);
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_R1, 0);
+            sljit_emit_op2(C, SLJIT_SHL, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, 4);
+            sljit_emit_op2(C, SLJIT_SHL, SLJIT_R1, 0, SLJIT_R1, 0,
+                           SLJIT_IMM, 4);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff + 16,
+                           SLJIT_R1, 0); // wrap mask (bytes)
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0,
+                           SLJIT_MEM1(SLJIT_R2), MAP_ENTRIES_OFFSET);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0,
+                           SLJIT_MEM1(SLJIT_SP), tmpOff); // key
+
+            // ---- probe loop ----
+            struct sljit_label* probeTop = sljit_emit_label(C);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0, SLJIT_R1, 0,
+                           SLJIT_R0, 0);                 // R2 = entry addr
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                           SLJIT_MEM1(SLJIT_R2), MAP_ENTRY_KEY_OFFSET);
+            struct sljit_jump* keyUndef = sljit_emit_cmp(C, SLJIT_EQUAL,
+                SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)MAP_UNDEFINED_VAL);
+            struct sljit_jump* keyMatch = sljit_emit_cmp(C, SLJIT_EQUAL,
+                SLJIT_R2, 0, SLJIT_R3, 0);
+            // Neither undefined nor equal: advance.
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, 16);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                           SLJIT_MEM1(SLJIT_SP), tmpOff + 16);
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_R2, 0);
+            struct sljit_jump* probeAgain = sljit_emit_jump(C, SLJIT_JUMP);
+            sljit_set_label(probeAgain, probeTop);
+
+            // keyMatch: found — load the stored value (getter) or overwrite it
+            // (setter, which never resizes on an existing key).
+            sljit_set_label(keyMatch, sljit_emit_label(C));
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0, SLJIT_R1, 0,
+                           SLJIT_R0, 0);                 // R2 = entry addr
+            if (n->flags & IR_FLAG_MAP_PROBE_GET)
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff + 40,
+                               SLJIT_R2, 0);
+            if (isPut) {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_SP), tmpOff + 8);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R2),
+                               MAP_ENTRY_VALUE_OFFSET, SLJIT_R0, 0);
+            } else {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_R2), MAP_ENTRY_VALUE_OFFSET);
+            }
+            struct sljit_jump* doneFound = sljit_emit_jump(C, SLJIT_JUMP);
+
+            sljit_set_label(keyUndef, sljit_emit_label(C));
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0, SLJIT_R1, 0,
+                           SLJIT_R0, 0);                 // R2 = entry addr
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                           SLJIT_MEM1(SLJIT_R2), MAP_ENTRY_VALUE_OFFSET);
+            struct sljit_jump* valueFalse = sljit_emit_cmp(C, SLJIT_EQUAL,
+                SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)MAP_FALSE_VAL);
+            // Tombstone: remember it (only the first) and keep probing.
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                           SLJIT_MEM1(SLJIT_SP), tmpOff + 24);
+            struct sljit_jump* tsSeen = sljit_emit_cmp(C, SLJIT_NOT_EQUAL,
+                SLJIT_R2, 0, SLJIT_IMM, 0);
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0, SLJIT_R1, 0,
+                           SLJIT_R0, 0);                 // R2 = entry addr
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff + 24,
+                           SLJIT_R2, 0);
+            sljit_set_label(tsSeen, sljit_emit_label(C));
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_IMM, 16);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                           SLJIT_MEM1(SLJIT_SP), tmpOff + 16);
+            sljit_emit_op2(C, SLJIT_AND, SLJIT_R0, 0, SLJIT_R0, 0,
+                           SLJIT_R2, 0);
+            struct sljit_jump* probeTomb = sljit_emit_jump(C, SLJIT_JUMP);
+            sljit_set_label(probeTomb, probeTop);
+
+            // valueFalse: empty slot — getter misses, setter inserts.
+            sljit_set_label(valueFalse, sljit_emit_label(C));
+            sljit_emit_op2(C, SLJIT_ADD, SLJIT_R2, 0, SLJIT_R1, 0,
+                           SLJIT_R0, 0);                 // R2 = entry addr
+            if (!isPut && (n->flags & IR_FLAG_MAP_PROBE_GET)) {
+                // Cache the first tombstone when present, otherwise the empty
+                // entry just found.
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_SP), tmpOff + 24);
+                struct sljit_jump* cachedTomb = sljit_emit_cmp(
+                    C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R2, 0);
+                sljit_set_label(cachedTomb, sljit_emit_label(C));
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP), tmpOff + 40,
+                               SLJIT_R0, 0);
+            }
+            if (isPut) {
+                // Insert at the remembered tombstone or this empty slot. The
+                // tombstone check must leave R0 holding the empty entry addr
+                // on the no-tombstone path: a branch to a label placed after
+                // the mov would skip it and write through a NULL pointer.
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_SP), tmpOff + 24);
+                struct sljit_jump* useTombstone = sljit_emit_cmp(
+                    C, SLJIT_NOT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, SLJIT_R2, 0);
+                sljit_set_label(useTombstone, sljit_emit_label(C));
+                // R0 = insertion entry addr.
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0),
+                               MAP_ENTRY_KEY_OFFSET, SLJIT_R3, 0);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                               SLJIT_MEM1(SLJIT_SP), tmpOff + 8);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_R0),
+                               MAP_ENTRY_VALUE_OFFSET, SLJIT_R2, 0);
+                // map->count++
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0,
+                               SLJIT_MEM1(SLJIT_SP), tmpOff + 32);
+                sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_R0, 0,
+                               SLJIT_MEM1(SLJIT_R2), MAP_COUNT_OFFSET);
+                sljit_emit_op2(C, SLJIT_ADD, SLJIT_R0, 0, SLJIT_R0, 0,
+                               SLJIT_IMM, 1);
+                sljit_emit_op1(C, SLJIT_MOV_S32, SLJIT_MEM1(SLJIT_R2),
+                               MAP_COUNT_OFFSET, SLJIT_R0, 0);
+            } else {
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_IMM, (sljit_sw)WREN_NULL_VAL);
+            }
+            struct sljit_jump* doneMap = sljit_emit_jump(C, SLJIT_JUMP);
+            if (!isPut) {
+                // Getter on an empty map also misses.
+                sljit_set_label(emptyMap, sljit_emit_label(C));
+                if (n->flags & IR_FLAG_MAP_PROBE_GET)
+                    sljit_emit_op1(C, SLJIT_MOV, SLJIT_MEM1(SLJIT_SP),
+                                   tmpOff + 40, SLJIT_IMM, 0);
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0,
+                               SLJIT_IMM, (sljit_sw)WREN_NULL_VAL);
+                struct sljit_jump* doneEmpty = sljit_emit_jump(C, SLJIT_JUMP);
+                sljit_set_label(doneEmpty, sljit_emit_label(C));
+            } else {
+                // Put on a zero-capacity map: the resize guard should have
+                // fired already; route here to the interpreter's insert for
+                // safety (capacity can never be 0 past the guard).
+                sljit_set_label(emptyMap, sljit_emit_label(C));
+                if (snapId < (uint16_t)maxSnapshots &&
+                    exitJumpCount[snapId] < MAX_EXITS_PER_SNAP)
+                    exitJumpArr[snapId][exitJumpCount[snapId]++] =
+                        sljit_emit_jump(C, SLJIT_JUMP);
+                struct sljit_jump* putEmptyDone = sljit_emit_jump(C, SLJIT_JUMP);
+                sljit_set_label(putEmptyDone, sljit_emit_label(C));
+            }
+
+            // done: store result R0 into n->id (getter only).
+            sljit_set_label(doneMap, sljit_emit_label(C));
+            sljit_set_label(doneFound, sljit_emit_label(C));
+            if (!isPut) {
+                int dstReg, dstMem; sljit_sw dstOff;
+                getGP(ra, n->id, &dstReg, &dstMem, &dstOff);
+                sljit_emit_op1(C, SLJIT_MOV, dstReg, dstMem ? dstOff : 0,
+                               SLJIT_R0, 0);
             }
             break;
         }
@@ -3396,6 +3994,7 @@ JitTrace* wrenJitCodegen(void* vm, IRBuffer* ir, RegAllocState* ra,
     if (maxSnapshots > 0) {
         trace->snapshots = (JitSnapshot*)calloc((size_t)maxSnapshots,
                                                 sizeof(JitSnapshot));
+        trace->nested_exit_cache = (uint8_t*)calloc((size_t)maxSnapshots, 1);
         if (trace->snapshots) {
             for (int si = 0; si < maxSnapshots; si++) {
                 const IRSnapshot* irSnap = &ir->snapshots[si];

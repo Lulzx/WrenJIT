@@ -38,6 +38,17 @@ typedef enum {
     IR_EQ,
     IR_NEQ,
 
+    // Boxed equality: 64-bit compare of two NaN-tagged Wren Values -> raw
+    // bool. Exact for singleton/null/bool operands; the recorder emits these
+    // only for ==/!= against null/bool, where identity is the whole meaning.
+    IR_VAL_EQ,
+    IR_VAL_NEQ,
+
+    // Boxed conditional select. If op1 is null choose op2, otherwise choose
+    // imm.select.value. The recorder currently uses this for the canonical
+    // `old == null ? one : old + one` map-counting idiom.
+    IR_SELECT_NULL,
+
     // Bitwise (after converting to int)
     IR_BAND,
     IR_BOR,
@@ -56,10 +67,15 @@ typedef enum {
     IR_STORE_FIELD,      // store object field
     IR_LOAD_RANGE,       // load an ObjRange shape field as a raw double
     IR_LIST_COUNT,       // load List.count as a raw double
+    IR_LIST_ITERATE,     // List.iterate(boxed iterator) -> boxed index/false
     IR_LIST_LOAD,        // guarded list[index] load (op1=list, op2=raw index)
     IR_LIST_STORE,       // guarded list[index] store (value in imm.list.value)
     IR_LIST_BOUNDS_GUARD,// hoisted list.count >= limit guard (op1=list, op2=limit)
     IR_LIST_DATA,        // cached List.elements.data pointer (op1=list) -> ptr
+
+    // Map hash-table access (inline linear probe; op1=map, op2=boxed key)
+    IR_MAP_GET,          // map[key] -> boxed Value (null on miss)
+    IR_MAP_PUT,          // map[key] = value (value in imm.map.value, resize guarded)
 
     // Module variable access
     IR_LOAD_MODULE_VAR,
@@ -83,6 +99,7 @@ typedef enum {
     IR_GUARD_TRUE,       // assert value is truthy (not false/null)
     IR_GUARD_FALSE,      // assert value is falsy
     IR_GUARD_NOT_NULL,   // assert value is not null
+    IR_GUARD_NUM_OR_NULL,// assert value is either a number or null
     IR_GUARD_RANGE,      // assert exact-integer value with |value| <= limit
 
     // Control flow
@@ -163,6 +180,14 @@ typedef struct {
             uint16_t snapshot;   // type/index/bounds failure exit
         } list;
         struct {
+            uint16_t value;      // stored boxed Value (IR_MAP_PUT only)
+            uint16_t snapshot;   // resize-guard failure exit
+            uint16_t probe;      // preceding MAP_GET whose slot can be reused
+        } map;
+        struct {
+            uint16_t value;      // value selected when op1 is not null
+        } select;
+        struct {
             uint16_t limit;      // raw numeric range limit SSA
             uint16_t state;      // boxed boolean state SSA
             uint16_t object;     // boxed instance SSA
@@ -205,6 +230,8 @@ typedef struct {
     // List access whose per-access bounds check is hoisted to a
     // IR_LIST_BOUNDS_GUARD at the loop header.
     #define IR_FLAG_BOUNDS_HOISTED 0x80
+    #define IR_FLAG_MAP_PROBE_GET 0x200
+    #define IR_FLAG_MAP_REUSE_PUT 0x400
 } IRNode;
 
 // ---------------------------------------------------------------------------

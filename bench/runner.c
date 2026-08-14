@@ -60,6 +60,30 @@ static double getTimeMs(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+static WrenVM* g_vm = NULL;
+#ifdef WREN_JIT
+#include <signal.h>
+#include <unistd.h>
+static void onSigint(int sig) {
+    (void)sig;
+    if (g_vm && g_vm->jit) {
+        fprintf(stderr, "\n[SIGINT] compiled=%llu aborted=%llu exits=%llu\n",
+                (unsigned long long)g_vm->jit->traces_compiled,
+                (unsigned long long)g_vm->jit->traces_aborted,
+                (unsigned long long)g_vm->jit->total_exits);
+        for (uint32_t i = 0; i < g_vm->jit->trace_capacity; i++) {
+            JitTrace* t = &g_vm->jit->traces[i];
+            if (t->code != NULL)
+                fprintf(stderr, "  trace#%u exec=%llu exits=%llu\n",
+                        i, (unsigned long long)t->exec_count,
+                        (unsigned long long)t->exit_count);
+        }
+        fflush(stderr);
+    }
+    _exit(0);
+}
+#endif
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <script.wren> [--jit] [--no-jit]\n", argv[0]);
@@ -83,6 +107,10 @@ int main(int argc, char* argv[]) {
     config.errorFn = errorFn;
 
     WrenVM* vm = wrenNewVM(&config);
+    g_vm = vm;
+#ifdef WREN_JIT
+    signal(SIGINT, onSigint);
+#endif
 
 #ifdef WREN_JIT
     if (useJit && vm->jit != NULL) {

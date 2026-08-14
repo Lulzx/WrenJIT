@@ -276,6 +276,9 @@ const char* irOpName(IROp op)
     case IR_GTE:            return "GTE";
     case IR_EQ:             return "EQ";
     case IR_NEQ:            return "NEQ";
+    case IR_VAL_EQ:         return "VAL_EQ";
+    case IR_VAL_NEQ:        return "VAL_NEQ";
+    case IR_SELECT_NULL:    return "SELECT_NULL";
     case IR_BAND:           return "BAND";
     case IR_BOR:            return "BOR";
     case IR_BXOR:           return "BXOR";
@@ -289,10 +292,13 @@ const char* irOpName(IROp op)
     case IR_STORE_FIELD:    return "STORE_FIELD";
     case IR_LOAD_RANGE:     return "LOAD_RANGE";
     case IR_LIST_COUNT:     return "LIST_COUNT";
+    case IR_LIST_ITERATE:   return "LIST_ITERATE";
     case IR_LIST_LOAD:      return "LIST_LOAD";
     case IR_LIST_STORE:     return "LIST_STORE";
     case IR_LIST_BOUNDS_GUARD: return "LIST_BOUNDS_GUARD";
     case IR_LIST_DATA:      return "LIST_DATA";
+    case IR_MAP_GET:        return "MAP_GET";
+    case IR_MAP_PUT:        return "MAP_PUT";
     case IR_LOAD_MODULE_VAR:  return "LOAD_MODULE_VAR";
     case IR_STORE_MODULE_VAR: return "STORE_MODULE_VAR";
     case IR_BOX_NUM:        return "BOX_NUM";
@@ -310,6 +316,7 @@ const char* irOpName(IROp op)
     case IR_GUARD_TRUE:     return "GUARD_TRUE";
     case IR_GUARD_FALSE:    return "GUARD_FALSE";
     case IR_GUARD_NOT_NULL: return "GUARD_NOT_NULL";
+    case IR_GUARD_NUM_OR_NULL: return "GUARD_NUM_OR_NULL";
     case IR_GUARD_RANGE:    return "GUARD_RANGE";
     case IR_PHI:            return "PHI";
     case IR_LOOP_HEADER:    return "LOOP_HEADER";
@@ -359,6 +366,10 @@ void irBufferDump(const IRBuffer* buf)
             printf(" %%%04d.%d", n->op1, n->imm.mem.field);
             if (n->op2 != IR_NONE) printf(" %%%04d", n->op2);
             break;
+        case IR_LIST_ITERATE:
+            printf(" %%%04d %%%04d snap=%d", n->op1, n->op2,
+                   n->imm.list.snapshot);
+            break;
         case IR_SIDE_EXIT:
             printf(" snap=%d", n->imm.snapshot_id);
             break;
@@ -370,7 +381,12 @@ void irBufferDump(const IRBuffer* buf)
         case IR_GUARD_TRUE:
         case IR_GUARD_FALSE:
         case IR_GUARD_NOT_NULL:
+        case IR_GUARD_NUM_OR_NULL:
             printf(" %%%04d snap=%d", n->op1, n->imm.snapshot_id);
+            break;
+        case IR_SELECT_NULL:
+            printf(" %%%04d ? %%%04d : %%%04d", n->op1, n->op2,
+                   n->imm.select.value);
             break;
         case IR_GUARD_CLASS:
             printf(" %%%04d class=%p snap=%d", n->op1, n->imm.ptr, n->op2);
@@ -382,6 +398,17 @@ void irBufferDump(const IRBuffer* buf)
             if (n->op1 != IR_NONE) printf(" %%%04d", n->op1);
             if (n->op2 != IR_NONE) printf(" %%%04d", n->op2);
             printf(" val=%%%04d", n->imm.list.value);
+            break;
+        case IR_MAP_GET:
+            if (n->op1 != IR_NONE) printf(" %%%04d", n->op1);
+            if (n->op2 != IR_NONE) printf(" %%%04d", n->op2);
+            break;
+        case IR_MAP_PUT:
+            if (n->op1 != IR_NONE) printf(" %%%04d", n->op1);
+            if (n->op2 != IR_NONE) printf(" %%%04d", n->op2);
+            printf(" val=%%%04d", n->imm.map.value);
+            if (n->flags & IR_FLAG_MAP_REUSE_PUT)
+                printf(" probe=%%%04d", n->imm.map.probe);
             break;
         default:
             if (n->op1 != IR_NONE) printf(" %%%04d", n->op1);
@@ -397,6 +424,8 @@ void irBufferDump(const IRBuffer* buf)
             if (n->flags & IR_FLAG_HOISTED) printf("hoist ");
             if (n->flags & IR_FLAG_GUARD) printf("guard ");
             if (n->flags & IR_FLAG_SNAPSHOT_ONLY_BOX) printf("snapshot-box ");
+            if (n->flags & IR_FLAG_MAP_PROBE_GET) printf("probe-get ");
+            if (n->flags & IR_FLAG_MAP_REUSE_PUT) printf("reuse-put ");
             printf("]");
         }
         printf("\n");
@@ -435,6 +464,12 @@ void irMarkSnapshotOnlyBoxes(IRBuffer* buf)
             buf->nodes[n->op2].flags &= ~IR_FLAG_SNAPSHOT_ONLY_BOX;
         if (n->op == IR_LIST_STORE && n->imm.list.value < buf->count)
             buf->nodes[n->imm.list.value].flags &=
+                (uint8_t)~IR_FLAG_SNAPSHOT_ONLY_BOX;
+        if (n->op == IR_MAP_PUT && n->imm.map.value < buf->count)
+            buf->nodes[n->imm.map.value].flags &=
+                (uint8_t)~IR_FLAG_SNAPSHOT_ONLY_BOX;
+        if (n->op == IR_SELECT_NULL && n->imm.select.value < buf->count)
+            buf->nodes[n->imm.select.value].flags &=
                 (uint8_t)~IR_FLAG_SNAPSHOT_ONLY_BOX;
     }
 

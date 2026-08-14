@@ -112,12 +112,16 @@ void regAllocInit(RegAllocState* state, int ssa_count)
 {
     memset(state, 0, sizeof(*state));
 
-    // All registers start free, except R0/R1 and FR0/FR1 which are reserved
-    // as scratch for the codegen (guards, box/unbox, loads/stores use them).
+    // All registers start free, except R0-R3 and FR0/FR1 which are reserved
+    // as scratch for the codegen (guards, box/unbox, loads/stores, and the
+    // register-resident map probe loop use them). R0/R1 were already reserved;
+    // R2/R3 joined when the Map probe needed a 4-register loop.
     for (int i = 0; i < GP_SCRATCH_COUNT; i++)
         state->gp_scratch_free[i] = true;
     state->gp_scratch_free[0] = false;  // R0 reserved as scratch
     state->gp_scratch_free[1] = false;  // R1 reserved as scratch
+    state->gp_scratch_free[2] = false;  // R2 reserved as scratch
+    state->gp_scratch_free[3] = false;  // R3 reserved as scratch
 
     for (int i = 0; i < FP_SCRATCH_COUNT; i++)
         state->fp_scratch_free[i] = true;
@@ -244,6 +248,20 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
                 if (in_loop) use_count[ref]++;
             }
         }
+        if (n->op == IR_MAP_PUT) {
+            uint16_t ref = n->imm.map.value;
+            if (ref < buf->count && defined[ref] && i > range_end[ref]) {
+                range_end[ref] = i;
+                if (in_loop) use_count[ref]++;
+            }
+        }
+        if (n->op == IR_SELECT_NULL) {
+            uint16_t ref = n->imm.select.value;
+            if (ref < buf->count && defined[ref] && i > range_end[ref]) {
+                range_end[ref] = i;
+                if (in_loop) use_count[ref]++;
+            }
+        }
     }
 
     // Pass 1b: Fix up forward-referenced constants. Strength-reduction rewrites
@@ -279,12 +297,14 @@ void regAllocComputeRanges(RegAllocState* state, const IRBuffer* buf)
         } else if (n->op == IR_GUARD_CLASS) {
             // GUARD_CLASS stores snapshot in op2 (not imm.snapshot_id)
             sid = n->op2;
-        } else if (n->op == IR_GUARD_NUM || n->op == IR_GUARD_BOOL ||
+        } else if (n->op == IR_GUARD_NUM ||
+                   n->op == IR_GUARD_NUM_OR_NULL || n->op == IR_GUARD_BOOL ||
                    n->op == IR_GUARD_TRUE ||
                    n->op == IR_GUARD_FALSE || n->op == IR_GUARD_NOT_NULL ||
                    (n->flags & IR_FLAG_INT_GUARD)) {
             sid = n->imm.snapshot_id;
-        } else if (n->op == IR_LIST_LOAD || n->op == IR_LIST_STORE) {
+        } else if (n->op == IR_LIST_ITERATE || n->op == IR_LIST_LOAD ||
+                   n->op == IR_LIST_STORE) {
             sid = n->imm.list.snapshot;
         } else if (n->op == IR_LOOP_EXIT) {
             // The deopt snapshot on the truthy path of a loop recorded at its

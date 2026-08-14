@@ -79,6 +79,12 @@ typedef struct {
     // path). Drives the degenerate-trace re-record policy.
     uint32_t loop_handoff_exits;
 
+    // Memoized exit_resumes_in_nested_loop results, one byte per snapshot:
+    // 0 = unknown, 1 = resume pc is inside a nested loop, 2 = it is not. The
+    // bytecode is immutable for a function, so a snapshot's answer never
+    // changes; caching it turns a per-exit up-to-1KB scan into a load.
+    uint8_t* nested_exit_cache;
+
     // Number of IR_LIST_BOUNDS_GUARD nodes in this trace (diagnostic for
     // tests: > 0 means list bounds were hoisted out of a counted loop).
     uint16_t bounds_hoisted_guards;

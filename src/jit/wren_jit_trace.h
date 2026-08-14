@@ -90,6 +90,10 @@ typedef struct {
     // already represented in IR. Suppress hooks from that callee frame.
     int suppressed_frame_depth;
 
+    // A recognized straight-line ternary is already represented by a select
+    // in IR. Ignore the interpreter's chosen arm until it reaches the merge.
+    uint8_t* select_merge_pc;
+
     // Open nested loops inside the anchor trace (see NestedLoop above).
     int nested_depth;
     NestedLoop nested[JIT_MAX_NESTED_LOOPS];

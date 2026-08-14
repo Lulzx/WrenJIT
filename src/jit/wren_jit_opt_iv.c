@@ -47,6 +47,21 @@ static bool isIntType(const IRBuffer* buf, uint16_t id)
     return buf->nodes[id].type == IR_TYPE_INT;
 }
 
+// A null-select deliberately evaluates its numeric arm speculatively. Its
+// boxed input may be null, so converting the associated UNBOX_NUM to the
+// guarded UNBOX_INT form would deopt on the very value the select handles.
+static bool isNullableSelectInput(const IRBuffer* buf, uint16_t boxed)
+{
+    for (uint16_t i = 0; i < buf->count; i++) {
+        const IRNode* n = &buf->nodes[i];
+        if (n->flags & IR_FLAG_DEAD) continue;
+        if ((n->op == IR_SELECT_NULL || n->op == IR_GUARD_NUM_OR_NULL) &&
+            n->op1 == boxed)
+            return true;
+    }
+    return false;
+}
+
 static bool ivIsComparison(IROp op)
 {
     return op == IR_LT || op == IR_GT || op == IR_LTE ||
@@ -177,6 +192,7 @@ static bool tryPromoteToInt(IRBuffer* buf, uint16_t id, uint16_t header,
         return true;
     }
     if (n->op == IR_UNBOX_NUM) {
+        if (isNullableSelectInput(buf, n->op1)) return false;
         n->op   = IR_UNBOX_INT;
         n->type = IR_TYPE_INT;
         // The INT_GUARD integrality check is emitted at the LOOP_HEADER for a
@@ -504,6 +520,7 @@ void irOptIVTypeInference(IRBuffer* buf)
 
         if (n->op == IR_UNBOX_NUM && n->op1 != IR_NONE &&
             n->op1 < buf->count && isIntType(buf, n->op1)) {
+            if (isNullableSelectInput(buf, n->op1)) continue;
             n->op   = IR_UNBOX_INT;
             n->type = IR_TYPE_INT;
         }
@@ -522,6 +539,7 @@ void irOptIVTypeInference(IRBuffer* buf)
         if (phi->op1 == IR_NONE || phi->op1 >= buf->count) continue;
         IRNode* preVal = &buf->nodes[phi->op1];
         if (!(preVal->flags & IR_FLAG_DEAD) && preVal->op == IR_UNBOX_NUM) {
+            if (isNullableSelectInput(buf, preVal->op1)) continue;
             preVal->op   = IR_UNBOX_INT;
             preVal->type = IR_TYPE_INT;
             uint16_t snap = snapshotForNode(buf, phi->op1);

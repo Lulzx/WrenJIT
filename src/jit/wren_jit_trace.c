@@ -237,6 +237,96 @@ static bool tryEmitConditionalModuleIncrement(JitRecorder* r, WrenVM* vm,
     return true;
 }
 
+// Recognize the compiler's straight-line form of
+//
+//     value == null ? 1 : value + 1
+//
+// and model both arms with one conditional select. During recording the
+// interpreter still executes one arm; select_merge_pc suppresses those hooks
+// until the common successor, where the logical stack already contains the
+// selected SSA value.
+static bool tryEmitNullCountSelect(JitRecorder* r, WrenVM* vm,
+                                   CallFrame* frame, uint8_t* ip,
+                                   uint16_t cond_ssa, uint16_t offset)
+{
+    if (cond_ssa >= r->ir.count) return false;
+    IRNode* box = &r->ir.nodes[cond_ssa];
+    if (box->op != IR_BOX_BOOL || box->op1 >= r->ir.count) return false;
+    IRNode* eq = &r->ir.nodes[box->op1];
+    if (eq->op != IR_VAL_EQ || eq->op1 >= r->ir.count ||
+        eq->op2 >= r->ir.count)
+        return false;
+
+    uint16_t value = IR_NONE;
+    if (r->ir.nodes[eq->op1].op == IR_CONST_NULL) value = eq->op2;
+    if (r->ir.nodes[eq->op2].op == IR_CONST_NULL) value = eq->op1;
+    if (value == IR_NONE) return false;
+
+    uint8_t* then_pc = ip + 3;
+    uint8_t* else_pc = then_pc + offset;
+    if (offset != 6 || then_pc[0] != CODE_CONSTANT ||
+        then_pc[3] != CODE_JUMP)
+        return false;
+
+    ObjFn* fn = frame->closure->fn;
+    uint16_t then_const = readShort(then_pc);
+    if (then_const >= (uint16_t)fn->constants.count ||
+        !IS_NUM(fn->constants.data[then_const]) ||
+        AS_NUM(fn->constants.data[then_const]) != 1.0)
+        return false;
+
+    int old_slot;
+    int load_len;
+    if (else_pc[0] >= CODE_LOAD_LOCAL_0 &&
+        else_pc[0] <= CODE_LOAD_LOCAL_8) {
+        old_slot = (int)(else_pc[0] - CODE_LOAD_LOCAL_0);
+        load_len = 1;
+    } else if (else_pc[0] == CODE_LOAD_LOCAL) {
+        old_slot = else_pc[1];
+        load_len = 2;
+    } else {
+        return false;
+    }
+    if (slotGet(r, old_slot) != value) return false;
+
+    uint8_t* add_const_pc = else_pc + load_len;
+    uint8_t* add_call_pc = add_const_pc + 3;
+    if (add_const_pc[0] != CODE_CONSTANT || add_call_pc[0] != CODE_CALL_1)
+        return false;
+    uint16_t add_const = readShort(add_const_pc);
+    uint16_t add_symbol = readShort(add_call_pc);
+    if (add_const >= (uint16_t)fn->constants.count ||
+        !IS_NUM(fn->constants.data[add_const]) ||
+        AS_NUM(fn->constants.data[add_const]) != 1.0 ||
+        !methodNameEquals(vm, add_symbol, "+(_)"))
+        return false;
+
+    uint8_t* merge_pc = add_call_pc + 3;
+    if (then_pc + 6 + readShort(then_pc + 3) != merge_pc) return false;
+
+    // On failure, resume at the else arm. The JUMP_IF condition is known
+    // false for every non-null invalid value and has already been popped.
+    uint16_t snap = emitSnapshot(r, else_pc);
+    uint16_t guard = irEmit(&r->ir, IR_GUARD_NUM_OR_NULL, value, IR_NONE,
+                            IR_TYPE_VOID);
+    r->ir.nodes[guard].imm.snapshot_id = snap;
+    r->ir.nodes[guard].flags |= IR_FLAG_GUARD;
+
+    uint16_t one_num = irEmitConst(&r->ir, 1.0);
+    uint16_t one_box = irEmitBox(&r->ir, one_num);
+    uint16_t old_num = irEmitUnbox(&r->ir, value);
+    uint16_t incremented_num = irEmit(&r->ir, IR_ADD, old_num, one_num,
+                                      IR_TYPE_NUM);
+    uint16_t incremented_box = irEmitBox(&r->ir, incremented_num);
+    uint16_t selected = irEmit(&r->ir, IR_SELECT_NULL, value, one_box,
+                               IR_TYPE_VALUE);
+    r->ir.nodes[selected].imm.select.value = incremented_box;
+    slotSet(r, r->stack_top, selected);
+    r->stack_top++;
+    r->select_merge_pc = merge_pc;
+    return true;
+}
+
 // -------------------------------------------------------------------------
 // jitRecorderStart
 // -------------------------------------------------------------------------
@@ -355,6 +445,11 @@ bool jitRecorderStep(WrenJitState* jit, WrenVM* vm, uint8_t* ip)
     ObjFiber* fiber = vm->fiber;
     CallFrame* frame = &fiber->frames[fiber->numFrames - 1];
     Value* stackStart = frame->stackStart;
+
+    if (r->select_merge_pc != NULL) {
+        if (ip != r->select_merge_pc) return false;
+        r->select_merge_pc = NULL;
+    }
 
     // A nested loop marked loop_only (see the CODE_LOOP handler) is running
     // out its remaining iterations in the interpreter while recording is
@@ -762,6 +857,18 @@ bool jitRecorderStep(WrenJitState* jit, WrenVM* vm, uint8_t* ip)
         int recv_slot = r->stack_top - 2;
         int arg_slot = r->stack_top - 1;
         Value recv_val = stackStart[recv_slot];
+        Value arg_val = stackStart[arg_slot];
+
+        // `==`/`!=` against a null or bool argument is a boxed identity
+        // compare. The receiver can be any type across iterations (a map
+        // getter returns null for unseen keys and a number for seen ones), so
+        // route it to the widen before the Num specialization, which would
+        // otherwise guard the null/bool argument away and side-exit forever.
+        if ((methodNameEquals(vm, symbol, "==(_)") ||
+             methodNameEquals(vm, symbol, "!=(_)")) &&
+            (IS_NULL(arg_val) || IS_BOOL(arg_val))) {
+            if (jitTryWidenCall1(jit, vm, stackStart, symbol, ip)) break;
+        }
 
         if (IS_NUM(recv_val)) {
             IROp binop = numMethodToIROp(vm, symbol);
@@ -927,9 +1034,23 @@ bool jitRecorderStep(WrenJitState* jit, WrenVM* vm, uint8_t* ip)
                     // one must hand control back to the interpreter at the
                     // body start (the loop would have continued).
                     uint16_t snap = emitSnapshot(r, ip + 3);
+                    uint16_t after = r->ir.count;
                     for (int k = 0; k < nl->exit_count; k++) {
                         r->ir.nodes[nl->exit_nodes[k]].imm.jump.target =
-                            r->ir.count;
+                            after;
+                    }
+                    // The same condition was seen once before its back-edge
+                    // proved this was a loop. Make that peeled entry test use
+                    // the newly recorded after-loop block too; otherwise the
+                    // common first-character mismatch deopts once per regex
+                    // attempt even though the outer trace contains the code
+                    // after the matcher.
+                    for (int p = 0; p < r->pending_entry_count; p++) {
+                        if (r->pending_entry[p].ip != ip) continue;
+                        IRNode* entry = &r->ir.nodes[r->pending_entry[p].node];
+                        entry->imm.jump.target = after;
+                        entry->imm.jump.snapshot = IR_NONE;
+                        r->pending_entry[p].ip = NULL;
                     }
                     // Only the exit test itself deopts on truthy; earlier
                     // AND short-circuit exits fall through to it.
@@ -959,6 +1080,13 @@ bool jitRecorderStep(WrenJitState* jit, WrenVM* vm, uint8_t* ip)
         // branchless 0/1 add, keeping both boolean outcomes on this trace.
         if (taken && tryEmitConditionalModuleIncrement(r, vm, frame, ip,
                                                        cond_ssa, offset)) {
+            break;
+        }
+
+        // The compiler's canonical null-count ternary can cover both arms
+        // with a conditional select. This applies regardless of which arm the
+        // interpreter happened to take while recording.
+        if (tryEmitNullCountSelect(r, vm, frame, ip, cond_ssa, offset)) {
             break;
         }
 

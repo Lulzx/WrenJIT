@@ -691,6 +691,57 @@ TEST(test_huge_loop_value_stays_double) {
     wrenFreeVM(vm);
 }
 
+TEST(test_map_null_count_select_covers_both_arms) {
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var counts = {}\n"
+        "var i = 0\n"
+        "while (i < 20000) {\n"
+        "  var key = i % 97\n"
+        "  var old = counts[key]\n"
+        "  counts[key] = old == null ? 1 : old + 1\n"
+        "  i = i + 1\n"
+        "}\n"
+        "var sum = 0\n"
+        "for (value in counts.values) sum = sum + value\n"
+        "System.print(\"%(sum),%(counts.count)\")\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "20000,97") != NULL);
+    assert(vm->jit->traces_compiled >= 1);
+    // Resize exits are logarithmic. A branch-specialized ternary would exit
+    // on nearly every repeated key after the first 97 insertions.
+    assert(vm->jit->total_exits < 200);
+    wrenFreeVM(vm);
+}
+
+TEST(test_nested_list_iterators_cross_inner_loop) {
+    // A list-for iterator PHI may be created before an intervening inner-loop
+    // header. Its back edge must still update that PHI; otherwise the native
+    // list loop repeats its first element forever (the regex-redux shape).
+    resetOutput();
+    WrenVM* vm = createVM();
+    const char* src =
+        "var rows = [[1, 2], [3, 4]]\n"
+        "var total = 0\n"
+        "var i = 0\n"
+        "while (i < 5000) {\n"
+        "  for (row in rows) {\n"
+        "    for (value in row) {\n"
+        "      var j = 0\n"
+        "      while (j < value) j = j + 1\n"
+        "      total = total + j\n"
+        "    }\n"
+        "  }\n"
+        "  i = i + 1\n"
+        "}\n"
+        "System.print(total)\n";
+    assert(wrenInterpret(vm, "main", src) == WREN_RESULT_SUCCESS);
+    assert(strstr(output_buf, "50000") != NULL);
+    assert(vm->jit->traces_compiled >= 1);
+    wrenFreeVM(vm);
+}
+
 TEST(test_short_inner_loop_records_after_retry) {
     // Recording that starts on a short inner loop's terminating back-edge
     // aborts once ("recording started at loop completion"), re-arms the hot
@@ -792,6 +843,8 @@ int main(void) {
     RUN(test_range_loop_stack_promotion);
     RUN(test_integer_comparison_specialization);
     RUN(test_huge_loop_value_stays_double);
+    RUN(test_map_null_count_select_covers_both_arms);
+    RUN(test_nested_list_iterators_cross_inner_loop);
     RUN(test_short_inner_loop_records_after_retry);
     RUN(test_snapshot_only_number_materializes_on_exit);
     RUN(test_recursive_numeric_kernel);
